@@ -22,12 +22,16 @@ codex plugin add jieli@jieliapp
 
 Then enable the plugin and trust its hooks with `/hooks`.
 
-## Configure the API key
+## Configuration
 
-Get an API key from [https://jieli.app](https://jieli.app). You can use an environment variable before starting the agent:
+Both plugins use `https://jieli.app` by default. Get an API key from [Jieli](https://jieli.app), or from your own Jieli instance if you self-host. For a self-hosted instance, set the base URL to its full access address, including `https://` or `http://`, and use an API key created on that same instance.
+
+You can set environment variables before starting Claude Code or Codex:
 
 ```bash
 export JIELI_API_KEY="your-jieli-api-key"
+# Optional; defaults to https://jieli.app. Change this for self-hosted Jieli.
+export JIELI_BASE_URL="https://jieli.app"
 ```
 
 Recommended for both Claude Code and Codex: write this file, which works even after the agent is already running:
@@ -37,9 +41,12 @@ Path: `~/.config/jieli/settings.json`
 ```json
 {
   "api_key": "your-jieli-api-key",
+  "base_url": "https://jieli.app",
   "commit_trailer": true
 }
 ```
+
+`base_url` is optional and defaults to `https://jieli.app`. For self-hosted Jieli, replace it with your instance's URL, such as `https://jieli.example.com`. `JIELI_BASE_URL` takes precedence over this setting.
 
 `commit_trailer` is optional and defaults to `true`. Set it to `false` to disable the automatic `Jieli-Thread` trailer added by the `PreToolUse` hook.
 
