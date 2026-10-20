@@ -1,0 +1,13 @@
+{
+  "name": "jieli-plugin-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "node scripts/history-sync.mjs",
+    "build:history": "node scripts/build-history.mjs",
+    "test:history": "npm run build:history && node --test tests/history-sync.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

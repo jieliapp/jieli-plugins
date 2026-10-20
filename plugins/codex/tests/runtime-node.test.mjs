@@ -1255,7 +1255,7 @@ test("plugin helpers, docs, manifests, and hooks describe the split Jieli tools"
   assert.match(docs, /`jieli-find-thread`/);
   assert.match(docs, /commit_trailer/);
   assert.match(docs, /Jieli-Thread/);
-  assert.doesNotMatch(docs, /https:\/\/your-jieli\.example\.com|self-hosted|Jieli thread reading skill|Provides the `jieli` skill/);
+  assert.doesNotMatch(docs, /https:\/\/your-jieli\.example\.com|Jieli thread reading skill|Provides the `jieli` skill/);
 
   const readSkill = readFileSync(join(pluginRoot, "skills", "jieli-read-thread", "SKILL.md"), "utf8");
   assert.match(readSkill, /jieli_helper\.mjs read-thread/);

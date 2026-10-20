@@ -14,3 +14,5 @@ jobs:
           node-version: "22"
       - run: node --test plugins/claude-code/tests/runtime-node.test.mjs
       - run: node --test plugins/codex/tests/runtime-node.test.mjs
+      - run: npm ci
+      - run: npm run test:history

@@ -439,7 +439,7 @@ async function syncMain(args) {
   return 0;
 }
 
-async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = null) {
+async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = null, options = {}) {
   const transcriptPath = hookData.transcript_path;
   if (!transcriptPath) throw new Error("transcript_path is required");
   const transcript = await parseTranscript(transcriptPath, hookData.session_id || "", imageUploader);
@@ -472,7 +472,7 @@ async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = nu
       trigger: "sessionstart",
     });
   }
-  const summaryStats = summaryStatsForUpload({
+  const summaryStats = options.includeSummaryStats === false ? null : summaryStatsForUpload({
     provider: PROVIDER,
     threadId: providerThreadId,
     sessionId,
@@ -1605,6 +1605,7 @@ export {
   releaseSyncLock,
   requiredEnv,
   summaryStatsForUpload,
+  uploadAttachment,
   uploadAttachmentCached,
   uploadAttachmentData,
   uploadPayload,
@@ -1614,6 +1615,6 @@ export {
   writeSessionMapping,
 };
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (typeof JIELI_HISTORY_BUNDLE === "undefined" && import.meta.url === pathToFileURL(process.argv[1]).href) {
   process.exit(await main());
 }

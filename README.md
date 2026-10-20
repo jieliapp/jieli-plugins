@@ -50,6 +50,16 @@ Path: `~/.config/jieli/settings.json`
 
 `commit_trailer` is optional and defaults to `true`. Set it to `false` to disable the automatic `Jieli-Thread` trailer added by the `PreToolUse` hook.
 
+## Sync Existing Sessions
+
+With Node.js 20+, run `npm run sync` from this repository, or download and run the standalone script without cloning:
+
+```bash
+curl -fsSLo jieli-sync.mjs https://jieli.app/jieli-sync.mjs && node jieli-sync.mjs
+```
+
+Both commands upload existing Claude Code and Codex sessions using the configuration above, prompting for missing settings; use `--help` for options (`npm run sync -- --help` in this repository).
+
 ## What It Does
 
 - Syncs Claude Code sessions to Jieli threads.

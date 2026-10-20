@@ -478,7 +478,7 @@ function startArchiveSyncWorker() {
   child.unref();
 }
 
-async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = null, dataImageUploader = null) {
+async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = null, dataImageUploader = null, options = {}) {
   const transcriptPath = resolveTranscriptPath(hookData);
   const transcript = await parseTranscript(transcriptPath, hookData.session_id || "", imageUploader, dataImageUploader);
   const cwd = transcript.cwd || hookData.cwd || process.cwd();
@@ -532,7 +532,7 @@ async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = nu
       trigger: "sessionstart",
     });
   }
-  const summaryStats = summaryStatsForUpload({
+  const summaryStats = options.includeSummaryStats === false ? null : summaryStatsForUpload({
     provider: PROVIDER,
     threadId: providerThreadId,
     sessionId,
@@ -2207,6 +2207,7 @@ function formatError(error) {
 export {
   COMPACTION_PLACEHOLDER,
   acquireSyncLock,
+  archiveThread,
   buildHandoffInfo,
   buildHookResponse,
   buildMissingConfigHookResponse,
@@ -2233,6 +2234,7 @@ export {
   releaseSyncLock,
   requiredEnv,
   summaryStatsForUpload,
+  uploadAttachment,
   uploadAttachmentCached,
   uploadAttachmentData,
   uploadPayload,
@@ -2242,6 +2244,6 @@ export {
   writeSessionMapping,
 };
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (typeof JIELI_HISTORY_BUNDLE === "undefined" && import.meta.url === pathToFileURL(process.argv[1]).href) {
   process.exit(await main());
 }

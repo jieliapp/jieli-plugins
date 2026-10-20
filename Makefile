@@ -6,6 +6,7 @@ VALIDATOR_DEPS_DIR ?= /tmp/codex-plugin-validator-pyyaml
 test:
 	node --test plugins/claude-code/tests/runtime-node.test.mjs
 	node --test plugins/codex/tests/runtime-node.test.mjs
+	npm run test:history
 
 validate:
 	claude plugin validate . --strict
