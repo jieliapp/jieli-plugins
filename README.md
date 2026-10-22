@@ -90,3 +90,7 @@ This is best-effort pattern matching, not a guarantee. See the patterns in
 make test
 make validate
 ```
+
+## Acknowledgements
+
+Thanks to the [LINUX DO](https://linux.do) community for its support.
