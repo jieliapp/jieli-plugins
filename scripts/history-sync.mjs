@@ -58,11 +58,12 @@ async function configuration() {
 
 function transcript(path, agent, archived) {
   const bytes = readFileSync(path);
+  const decoded = agent === "codex" ? codex.decodeTranscriptBytes(path, bytes) : bytes;
   let meta, hasRows = false, sidechain = false;
   const invalidRecord = (message) => Object.assign(new Error(message), {
     sessionId: agent === "codex" ? meta?.id : meta?.sessionId || meta?.session_id,
   });
-  for (const [index, line] of bytes.toString("utf8").split(/\r?\n/).entries()) {
+  for (const [index, line] of decoded.toString("utf8").split(/\r?\n/).entries()) {
     if (!line.trim()) continue;
     let row;
     try { row = JSON.parse(line); } catch { throw invalidRecord(`invalid JSONL at line ${index + 1}`); }
@@ -116,7 +117,7 @@ function discover(opts) {
     for (const entry of readdirSync(root, { withFileTypes: true })) {
       const path = join(root, entry.name);
       if (entry.isDirectory() && entry.name !== "subagents") walk(path, agent, archived, indexOnly);
-      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      else if (entry.isFile() && (agent === "codex" ? codex.isCodexRolloutPath(entry.name) : entry.name.endsWith(".jsonl"))) {
         if (indexOnly) { if (!codexPaths.has(path)) codexPaths.set(path, null); }
         else add(path, agent, archived);
       }
@@ -149,7 +150,7 @@ function discover(opts) {
   // Index physical suffixes once, rather than rescanning every file for each base.
   const bases = new Map();
   for (const path of codexPaths.keys()) {
-    const name = basename(path), root = codexRoot(path);
+    const name = basename(path).replace(/\.zst$/, ""), root = codexRoot(path);
     for (const match of name.matchAll(/[-_]/g)) {
       const key = `${root}\0${name.slice(match.index + 1, -6)}`;
       if (!bases.has(key)) bases.set(key, []);

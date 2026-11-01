@@ -5,12 +5,14 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import * as zlib from "node:zlib";
 
 import * as runtime from "../scripts/jieli_node.mjs";
 import {
@@ -207,43 +209,85 @@ test("Codex transcript session id wins over hook session id and can be found fro
   });
 });
 
-test("sync follows paginated revert history across dates and excludes reverted tails", async () => {
-  const tmp = makeTempDir();
-  const sessions = join(tmp, "sessions");
-  const paths = ["15", "16", "17"].map((day, index) => {
-    const dir = join(sessions, "2026", "09", day);
-    mkdirSync(dir, { recursive: true });
-    return join(dir, `rollout-2026-09-${day}T12-00-00-stable${index ? `_segment-${index}` : ""}.jsonl`);
-  });
-  let base;
-  let ordinal = 0;
-  for (let index = 0; index < paths.length; index += 1) {
-    const entries = [
-      { type: "session_meta", timestamp: `2026-09-${15 + index}T04:00:00.000Z`, payload: {
-        id: "stable", history_mode: "paginated", ...(base ? { history_base: base } : {}),
-      } },
-      { type: "response_item", payload: { type: "message", role: "user", content: `保留第 ${index + 1} 段` } },
-    ];
-    writeJsonl(paths[index], entries);
-    ordinal += entries.length;
-    base = { thread_id: index ? `segment-${index}` : "stable", end_byte_offset: statSync(paths[index]).size, end_ordinal_exclusive: ordinal };
-    if (index < 2) writeJsonl(paths[index], [...entries,
-      { type: "response_item", payload: { type: "message", role: "user", content: "已回退，不应同步" } },
+for (const compressed of [false, true]) {
+  test(`sync follows ${compressed ? "compressed mixed" : "plain"} paginated revert history across dates and excludes reverted tails`, {
+    skip: compressed && typeof zlib.zstdCompressSync !== "function",
+  }, async () => {
+    const tmp = makeTempDir();
+    const sessions = join(tmp, "sessions");
+    const paths = ["15", "16", "17"].map((day, index) => {
+      const dir = join(sessions, "2026", "09", day);
+      mkdirSync(dir, { recursive: true });
+      return join(dir, `rollout-2026-09-${day}T12-00-00-stable${index ? `_segment-${index}` : ""}.jsonl`);
+    });
+    let base;
+    let ordinal = 0;
+    for (let index = 0; index < paths.length; index += 1) {
+      const entries = [
+        { type: "session_meta", timestamp: `2026-09-${15 + index}T04:00:00.000Z`, payload: {
+          id: "stable", history_mode: "paginated", ...(base ? { history_base: base } : {}),
+        } },
+        { type: "response_item", payload: { type: "message", role: "user", content: `保留第 ${index + 1} 段` } },
+      ];
+      writeJsonl(paths[index], entries);
+      ordinal += entries.length;
+      base = { thread_id: index ? `segment-${index}` : "stable", end_byte_offset: statSync(paths[index]).size, end_ordinal_exclusive: ordinal };
+      if (index < 2) writeJsonl(paths[index], [...entries,
+        { type: "response_item", payload: { type: "message", role: "user", content: "已回退，不应同步" } },
+      ]);
+    }
+    // An unreferenced sibling is not part of the active history.
+    writeJsonl(join(dirname(paths[2]), "rollout-other-stable_unrelated.jsonl"), [
+      { type: "session_meta", payload: { id: "stable" } },
+      { type: "response_item", payload: { type: "message", role: "user", content: "unrelated" } },
     ]);
-  }
-  // An unreferenced sibling is not part of the active history.
-  writeJsonl(join(dirname(paths[2]), "rollout-other-stable_unrelated.jsonl"), [
-    { type: "session_meta", payload: { id: "stable" } },
-    { type: "response_item", payload: { type: "message", role: "user", content: "unrelated" } },
-  ]);
-  await withEnv({ HOME: tmp, CODEX_HOME: tmp }, async () => {
-    const payload = await runtime.buildPayloadFromHook({ transcript_path: paths[2], session_id: "segment-2" });
-    assert.equal(payload.thread.id, "T-stable");
-    assert.deepEqual(payload.thread.messages.map((message) => message.content), ["保留第 1 段", "保留第 2 段", "保留第 3 段"]);
-    assert.equal(new Set(payload.thread.messages.map((message) => message.message_id)).size, 3);
-    assert.equal(payload.thread.created_ms, Date.parse("2026-09-15T04:00:00.000Z"));
-    assert.equal(payload.thread.updated_ms, Date.parse("2026-09-17T04:00:00.000Z"));
+    if (compressed) {
+      for (const index of [0, 2]) {
+        writeFileSync(`${paths[index]}.zst`, zlib.zstdCompressSync(readFileSync(paths[index])));
+        rmSync(paths[index]);
+        paths[index] += ".zst";
+      }
+    }
+    await withEnv({ HOME: tmp, CODEX_HOME: tmp }, async () => {
+      const payload = await runtime.buildPayloadFromHook({ transcript_path: paths[2], session_id: "segment-2" });
+      assert.equal(payload.thread.id, "T-stable");
+      assert.deepEqual(payload.thread.messages.map((message) => message.content), ["保留第 1 段", "保留第 2 段", "保留第 3 段"]);
+      assert.equal(new Set(payload.thread.messages.map((message) => message.message_id)).size, 3);
+      assert.equal(payload.thread.created_ms, Date.parse("2026-09-15T04:00:00.000Z"));
+      assert.equal(payload.thread.updated_ms, Date.parse("2026-09-17T04:00:00.000Z"));
+      assert.equal(runtime.findSessionTranscript("segment-2"), paths[2]);
+      const context = Buffer.from(JSON.stringify({ session_id: "segment-2", transcript_path: paths[2] })).toString("base64");
+      assert.equal(runtime.buildHandoffInfo(process.env, context).thread_id, "T-stable");
+    });
   });
+}
+
+test("compressed history rejects corrupt frames, invalid decompressed boundaries, and ambiguous parents", {
+  skip: typeof zlib.zstdCompressSync !== "function",
+}, async (t) => {
+  for (const failure of ["corrupt", "byte", "ordinal", "ambiguous"]) {
+    await t.test(failure, async () => {
+      const tmp = makeTempDir();
+      const dir = join(tmp, "sessions");
+      mkdirSync(dir);
+      const parent = join(dir, "rollout-stable.jsonl");
+      const leaf = join(dir, "rollout-stable_segment.jsonl");
+      writeJsonl(parent, [
+        { type: "session_meta", payload: { id: "stable" } },
+        { type: "response_item", payload: { type: "message", role: "user", content: "retained" } },
+      ]);
+      const bytes = readFileSync(parent);
+      writeFileSync(`${parent}.zst`, failure === "corrupt" ? Buffer.from("broken zstd") : zlib.zstdCompressSync(bytes));
+      if (failure !== "ambiguous") rmSync(parent);
+      writeJsonl(leaf, [{ type: "session_meta", payload: { id: "stable", history_base: {
+        thread_id: "stable", end_byte_offset: failure === "byte" ? 1 : bytes.length,
+        end_ordinal_exclusive: failure === "ordinal" ? 3 : 2,
+      } } }]);
+      const error = { corrupt: /Cannot decompress Codex rollout/, byte: /byte boundary/,
+        ordinal: /ordinal boundary/, ambiguous: /found 2/ }[failure];
+      await assert.rejects(() => runtime.buildPayloadFromHook({ transcript_path: leaf }), error);
+    });
+  }
 });
 
 test("sync rejects missing, cyclic, and invalid paginated history instead of uploading a partial thread", async () => {
@@ -894,43 +938,53 @@ test("configuration, upload, lock, session mapping, and missing transcript behav
   assert.throws(() => statSync(join(transcriptHome, ".jieli", "hooks.log")));
 });
 
-test("archive reconciliation sends only changed Codex session states", async () => {
-  const home = makeTempDir();
-  const codexRoot = join(home, "Codex");
-  const activePath = join(codexRoot, "sessions", "2026", "07", "11", "rollout-active-session.jsonl");
-  const archivedOriginalPath = join(codexRoot, "sessions", "2026", "07", "10", "rollout-archived-session.jsonl");
-  const archivedPath = join(codexRoot, "archived_sessions", "rollout-archived-session.jsonl");
-  mkdirSync(dirname(activePath), { recursive: true });
-  mkdirSync(dirname(archivedOriginalPath), { recursive: true });
-  mkdirSync(dirname(archivedPath), { recursive: true });
-  writeJsonl(activePath, [{ type: "session_meta", payload: { id: "active-session" } }]);
-  writeJsonl(archivedPath, [{ type: "session_meta", payload: { id: "archived-session" } }]);
+for (const compressed of [false, true]) {
+  test(`archive reconciliation sends only changed Codex session states (${compressed ? "compressed" : "plain"})`, {
+    skip: compressed && typeof zlib.zstdCompressSync !== "function",
+  }, async () => {
+    const home = makeTempDir();
+    const codexRoot = join(home, "Codex");
+    const activePath = join(codexRoot, "sessions", "2026", "07", "11", "rollout-active-session.jsonl");
+    const archivedOriginalPath = join(codexRoot, "sessions", "2026", "07", "10", "rollout-archived-session.jsonl");
+    const archivedPath = join(codexRoot, "archived_sessions", "rollout-archived-session.jsonl");
+    mkdirSync(dirname(activePath), { recursive: true });
+    mkdirSync(dirname(archivedOriginalPath), { recursive: true });
+    mkdirSync(dirname(archivedPath), { recursive: true });
+    writeJsonl(activePath, [{ type: "session_meta", payload: { id: "active-session" } }]);
+    writeJsonl(archivedPath, [{ type: "session_meta", payload: { id: "archived-session" } }]);
+    if (compressed) {
+      for (const path of [activePath, archivedPath]) {
+        writeFileSync(`${path}.zst`, zlib.zstdCompressSync(readFileSync(path)));
+        rmSync(path);
+      }
+    }
 
-  const { server, state } = createMockJieliServer();
-  const baseUrl = await listen(server);
-  try {
-    await withEnv({ HOME: home }, async () => {
-      runtime.writeSessionMapping("active-session", baseUrl, "T-active-session", activePath);
-      runtime.writeSessionMapping("archived-session", baseUrl, "T-archived-session", archivedOriginalPath);
+    const { server, state } = createMockJieliServer();
+    const baseUrl = await listen(server);
+    try {
+      await withEnv({ HOME: home }, async () => {
+        runtime.writeSessionMapping("active-session", baseUrl, "T-active-session", activePath);
+        runtime.writeSessionMapping("archived-session", baseUrl, "T-archived-session", archivedOriginalPath);
 
-      assert.equal(typeof runtime.reconcileArchivedSessions, "function");
-      await runtime.reconcileArchivedSessions(baseUrl, "secret");
-      assert.deepEqual(state.archives.map((request) => request.body), [
-        { provider: "codex", provider_thread_id: "T-archived-session", archived: true },
-      ]);
+        assert.equal(typeof runtime.reconcileArchivedSessions, "function");
+        await runtime.reconcileArchivedSessions(baseUrl, "secret");
+        assert.deepEqual(state.archives.map((request) => request.body), [
+          { provider: "codex", provider_thread_id: "T-archived-session", archived: true },
+        ]);
 
-      const mappingPath = join(home, ".jieli", "codex-sessions.json");
-      const firstMapping = JSON.parse(readFileSync(mappingPath, "utf8"));
-      assert.equal(firstMapping["active-session"].archive_synced, false);
-      assert.equal(firstMapping["archived-session"].archive_synced, true);
+        const mappingPath = join(home, ".jieli", "codex-sessions.json");
+        const firstMapping = JSON.parse(readFileSync(mappingPath, "utf8"));
+        assert.equal(firstMapping["active-session"].archive_synced, false);
+        assert.equal(firstMapping["archived-session"].archive_synced, true);
 
-      await runtime.reconcileArchivedSessions(baseUrl, "secret");
-      assert.equal(state.archives.length, 1);
-    });
-  } finally {
-    await close(server);
-  }
-});
+        await runtime.reconcileArchivedSessions(baseUrl, "secret");
+        assert.equal(state.archives.length, 1);
+      });
+    } finally {
+      await close(server);
+    }
+  });
+}
 
 test("archive reconciliation keeps failed states retryable and continues other sessions", async () => {
   const home = makeTempDir();

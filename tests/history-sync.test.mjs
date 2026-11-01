@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { after } from "node:test";
+import * as zlib from "node:zlib";
 
 const standalone = mkdtempSync(join(tmpdir(), "jieli-standalone-"));
 after(() => rmSync(standalone, { recursive: true, force: true }));
@@ -168,36 +169,76 @@ test("failed sessions remain retryable while successful sessions and changed sou
   assert.match(result.stdout, /2 uploaded, 0 skipped, 0 failed/);
 });
 
-test("Codex history imports only the unique current leaf and preserves archived sessions", async (t) => {
-  const home = fixture(t);
-  const server = await receiver(t);
-  const parent = codex(home, "stable", "retained prefix");
-  const boundary = readFileSync(parent).length;
-  writeFileSync(parent, JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: "reverted tail" } }) + "\n", { flag: "a" });
-  const leaf = jsonl(join(dirname(parent), "rollout-stable_segment-1.jsonl"), [
-    { type: "session_meta", payload: { id: "stable", cwd: home,
-      history_base: { thread_id: "stable", end_byte_offset: boundary, end_ordinal_exclusive: 2 } } },
-    { type: "response_item", payload: { type: "message", role: "user", content: "current tail" } },
-  ]);
-  const archived = codex(home, "archived");
-  const archiveDir = join(home, ".codex", "archived_sessions");
-  mkdirSync(archiveDir);
-  renameSync(archived, join(archiveDir, "rollout-archived.jsonl"));
-  let result = await run(home, server.url);
-  assert.equal(result.code, 0, result.stderr);
-  const thread = server.requests.find((r) => r.body.thread?.id === "T-stable").body.thread;
-  assert.deepEqual(thread.messages.map((m) => m.content), ["retained prefix", "current tail"]);
-  assert.equal(server.requests.filter((r) => r.body.thread?.id === "T-stable").length, 1);
-  assert.deepEqual(server.requests.find((r) => r.path === "/plugin/threads/archive").body,
-    { provider: "codex", provider_thread_id: "T-archived", archived: true });
-  result = await run(home, server.url);
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /0 uploaded, 2 skipped, 0 failed/);
-  // An explicit file still needs to locate its byte-bounded parent history.
-  result = await run(home, server.url, ["--agent", "codex", "--file", leaf, "--force"]);
-  assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(server.requests.at(-1).body.thread.messages.map((m) => m.content), ["retained prefix", "current tail"]);
-});
+for (const compressed of [false, true]) {
+  test(`Codex ${compressed ? "compressed" : "plain"} history imports only the unique current leaf and preserves archived sessions`, {
+    skip: compressed && typeof zlib.zstdCompressSync !== "function",
+  }, async (t) => {
+    const home = fixture(t);
+    const server = await receiver(t);
+    const parent = codex(home, "stable", "保留的历史 retained prefix");
+    const boundary = readFileSync(parent).length;
+    writeFileSync(parent, JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: "reverted tail" } }) + "\n", { flag: "a" });
+    let leaf = jsonl(join(dirname(parent), "rollout-stable_segment-1.jsonl"), [
+      { type: "session_meta", payload: { id: "stable", cwd: home,
+        history_base: { thread_id: "stable", end_byte_offset: boundary, end_ordinal_exclusive: 2 } } },
+      { type: "response_item", payload: { type: "message", role: "user", content: "current tail" } },
+    ]);
+    const archived = codex(home, "archived");
+    const archiveDir = join(home, ".codex", "archived_sessions");
+    mkdirSync(archiveDir);
+    renameSync(archived, join(archiveDir, "rollout-archived.jsonl"));
+    if (compressed) {
+      for (const path of [parent, leaf, join(archiveDir, "rollout-archived.jsonl")]) {
+        writeFileSync(`${path}.zst`, zlib.zstdCompressSync(readFileSync(path)));
+        rmSync(path);
+      }
+      leaf += ".zst";
+    }
+    let result = await run(home, server.url);
+    assert.equal(result.code, 0, result.stderr);
+    const thread = server.requests.find((r) => r.body.thread?.id === "T-stable").body.thread;
+    assert.deepEqual(thread.messages.map((m) => m.content), ["保留的历史 retained prefix", "current tail"]);
+    assert.equal(server.requests.filter((r) => r.body.thread?.id === "T-stable").length, 1);
+    assert.deepEqual(server.requests.find((r) => r.path === "/plugin/threads/archive").body,
+      { provider: "codex", provider_thread_id: "T-archived", archived: true });
+    result = await run(home, server.url);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /0 uploaded, 2 skipped, 0 failed/);
+    // An explicit file still needs to locate its byte-bounded parent history.
+    result = await run(home, server.url, ["--agent", "codex", "--file", leaf, "--force"]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(server.requests.at(-1).body.thread.messages.map((m) => m.content), ["保留的历史 retained prefix", "current tail"]);
+    if (compressed) {
+      const path = `${parent}.zst`;
+      const changed = zlib.zstdDecompressSync(readFileSync(path)).toString().replace("retained", "modified");
+      writeFileSync(path, zlib.zstdCompressSync(Buffer.from(changed)));
+      result = await run(home, server.url, ["--agent", "codex"]);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /1 uploaded, 1 skipped, 0 failed/);
+      assert.deepEqual(server.requests.at(-1).body.thread.messages.map((m) => m.content), ["保留的历史 modified prefix", "current tail"]);
+    }
+  });
+}
+
+for (const corrupt of [false, true]) {
+  test(`compressed input fails before upload (${corrupt ? "corrupt frame" : "unsupported Node"})`, {
+    skip: !corrupt && typeof zlib.zstdDecompressSync === "function",
+  }, async (t) => {
+    const home = fixture(t);
+    const server = await receiver(t);
+    const dir = join(home, ".codex", "sessions");
+    mkdirSync(dir, { recursive: true });
+    // A real Zstandard frame containing one session_meta record.
+    const frame = Buffer.from("KLUv/SA2sQEAeyJ0eXBlIjoic2Vzc2lvbl9tZXRhIiwicGF5bG9hZCI6eyJpZCI6ImNvbXByZXNzZWQifX0K", "base64");
+    const path = join(dir, "rollout-compressed.jsonl.zst");
+    writeFileSync(path, corrupt ? Buffer.from("broken zstd") : frame);
+    const result = await run(home, server.url, ["--agent", "codex", "--file", path]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, typeof zlib.zstdDecompressSync !== "function"
+      ? /requires Node.js 22\.15\+.*Zstandard/ : /Cannot decompress Codex rollout/);
+    assert.equal(server.requests.length, 0);
+  });
+}
 
 test("ambiguous history cannot overwrite a thread unless the user selects a file", async (t) => {
   const home = fixture(t);
@@ -295,23 +336,32 @@ test("concurrent history sync is excluded and interruption releases the lock for
   assert.equal(result.code, 0, result.stderr);
 });
 
-test("a transcript changed while uploading an image cannot replace the remote thread", async (t) => {
-  const home = fixture(t);
-  const path = jsonl(join(home, ".codex", "sessions", "rollout-changing.jsonl"), [
-    { type: "session_meta", payload: { id: "changing", cwd: home } },
-    { type: "response_item", payload: { type: "message", role: "user", content: [
-      { type: "input_text", text: "inspect changing image" },
-      { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" },
-    ] } },
-  ]);
-  const server = await receiver(t, (request) => {
-    if (request.path === "/plugin/attachments") writeFileSync(path, "\n", { flag: "a" });
+for (const compressed of [false, true]) {
+  test(`a ${compressed ? "compressed" : "plain"} transcript changed while uploading an image cannot replace the remote thread`, {
+    skip: compressed && typeof zlib.zstdCompressSync !== "function",
+  }, async (t) => {
+    const home = fixture(t);
+    let path = jsonl(join(home, ".codex", "sessions", "rollout-changing.jsonl"), [
+      { type: "session_meta", payload: { id: "changing", cwd: home } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [
+        { type: "input_text", text: "inspect changing image" },
+        { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" },
+      ] } },
+    ]);
+    if (compressed) {
+      writeFileSync(`${path}.zst`, zlib.zstdCompressSync(readFileSync(path)));
+      rmSync(path);
+      path += ".zst";
+    }
+    const server = await receiver(t, (request) => {
+      if (request.path === "/plugin/attachments") writeFileSync(path, "\n", { flag: "a" });
+    });
+    const result = await run(home, server.url);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /changed during sync/);
+    assert.equal(server.requests.filter((r) => r.path === "/plugin/threads/upload").length, 0);
   });
-  const result = await run(home, server.url);
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /changed during sync/);
-  assert.equal(server.requests.filter((r) => r.path === "/plugin/threads/upload").length, 0);
-});
+}
 
 test("custom agent homes override defaults and destination URL isolates completed uploads", async (t) => {
   const home = fixture(t);

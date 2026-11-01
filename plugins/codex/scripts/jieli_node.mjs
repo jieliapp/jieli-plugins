@@ -16,6 +16,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import * as zlib from "node:zlib";
 import { captureSummaryStatsBaseline, summaryStatsForUpload } from "./summary_stats.mjs";
 
 const PROVIDER = "codex";
@@ -618,13 +619,29 @@ async function parseTranscript(path, fallbackSessionId = "", imageUploader = nul
   return { id: sessionId || fallbackSessionId, cwd, branch, model, title, created_ms: createdMs, updated_ms: updatedMs || createdMs, messages };
 }
 
+function isCodexRolloutPath(path) {
+  return /\.jsonl(?:\.zst)?$/.test(path);
+}
+
+function decodeTranscriptBytes(path, bytes) {
+  if (!path.endsWith(".jsonl.zst")) return bytes;
+  if (typeof zlib.zstdDecompressSync !== "function") {
+    throw new Error("Reading compressed Codex rollouts requires Node.js 22.15+ with native Zstandard support");
+  }
+  try {
+    return zlib.zstdDecompressSync(bytes);
+  } catch (error) {
+    throw new Error(`Cannot decompress Codex rollout ${path}: ${error.message}`);
+  }
+}
+
 // Reverts retain a byte-bounded prefix of a previous physical rollout, not
 // every file sharing the logical session id. Line ordinals span that chain.
 function readTranscriptLines(path, endByteOffset = null, history = { seen: new Set(), paths: null }) {
   const canonicalPath = realpathSync(path);
   if (history.seen.has(canonicalPath)) throw new Error("Cyclic Codex history_base reference");
   history.seen.add(canonicalPath);
-  const bytes = readFileSync(path);
+  const bytes = decodeTranscriptBytes(path, readFileSync(path));
   if (endByteOffset !== null && (!Number.isSafeInteger(endByteOffset) || endByteOffset < 0 || endByteOffset > bytes.length ||
       (endByteOffset > 0 && bytes[endByteOffset - 1] !== 10))) {
     throw new Error(`Invalid Codex history_base byte boundary: ${endByteOffset}`);
@@ -650,12 +667,12 @@ function readTranscriptLines(path, endByteOffset = null, history = { seen: new S
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const candidate = join(dir, entry.name);
         if (entry.isDirectory()) stack.push(candidate);
-        else if (entry.isFile() && entry.name.endsWith(".jsonl")) history.paths.push(candidate);
+        else if (entry.isFile() && isCodexRolloutPath(entry.name)) history.paths.push(candidate);
       }
     }
   }
   const matches = history.paths.filter((candidate) => {
-    const name = basename(candidate);
+    const name = basename(candidate).replace(/\.zst$/, "");
     return name.endsWith(`-${base.thread_id}.jsonl`) || name.endsWith(`_${base.thread_id}.jsonl`);
   });
   if (matches.length !== 1) throw new Error(`Expected one Codex history_base rollout for ${base.thread_id}, found ${matches.length}`);
@@ -697,7 +714,7 @@ function findSessionTranscript(sessionId) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      } else if (entry.isFile() && isCodexRolloutPath(entry.name)) {
         candidates.push(path);
       }
     }
@@ -710,7 +727,7 @@ function findSessionTranscript(sessionId) {
   const spacedNeedle = `"id": "${target}"`;
   for (const path of candidates) {
     try {
-      const head = readFileSync(path, "utf8").slice(0, 20000);
+      const head = decodeTranscriptBytes(path, readFileSync(path)).toString("utf8").slice(0, 20000);
       if (head.includes(needle) || head.includes(spacedNeedle)) return path;
     } catch {}
   }
@@ -1528,7 +1545,7 @@ function rolloutSessionIds(root, sessionIds) {
         pending.push(path);
         continue;
       }
-      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      if (!entry.isFile() || !isCodexRolloutPath(entry.name)) continue;
       for (const sessionId of sessionIds) {
         if (entry.name.includes(sessionId)) found.add(sessionId);
       }
@@ -2138,7 +2155,7 @@ function readHandoffContext() {
 function readSessionMeta(path) {
   if (!path) return {};
   try {
-    const lines = readFileSync(path, "utf8").split(/\r?\n/);
+    const lines = decodeTranscriptBytes(path, readFileSync(path)).toString("utf8").split(/\r?\n/);
     for (const line of lines) {
       if (!line.trim()) continue;
       const entry = JSON.parse(line);
@@ -2216,12 +2233,14 @@ export {
   buildPayloadFromHook,
   captureSummaryStatsBaseline,
   createCommandRuntime,
+  decodeTranscriptBytes,
   fetchThreadExport,
   fetchThreads,
   findSessionTranscript,
   formatError,
   formatThreadsMarkdown,
   isSecretFilePath,
+  isCodexRolloutPath,
   limitOutput,
   missingConfigVars,
   normalizeShellHook,

@@ -52,7 +52,7 @@ Path: `~/.config/jieli/settings.json`
 
 ## Sync Existing Sessions
 
-With Node.js 20+, run `npm run sync` from this repository, or download and run the standalone script without cloning:
+With Node.js 22.15+, run `npm run sync` from this repository, or download and run the standalone script without cloning:
 
 ```bash
 curl -fsSLo jieli-sync.mjs https://jieli.app/jieli-sync.mjs && node jieli-sync.mjs
