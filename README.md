@@ -22,6 +22,12 @@ codex plugin add jieli@jieliapp
 
 Then enable the plugin and trust its hooks with `/hooks`.
 
+Codex title synchronization uses the installed `codex app-server` API (verified
+with Codex 0.165.0). Keep `codex` on your PATH, including on Windows; no separate
+`sqlite3` installation is needed. Codex resolves its own database configuration.
+If metadata cannot be read, synchronization reports an error instead of replacing
+the stored title with a transcript message.
+
 ## Configuration
 
 Both plugins use `https://jieli.app` by default. Get an API key from [Jieli](https://jieli.app), or from your own Jieli instance if you self-host. For a self-hosted instance, set the base URL to its full access address, including `https://` or `http://`, and use an API key created on that same instance.

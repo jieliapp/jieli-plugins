@@ -493,7 +493,7 @@ test("rebuilding after a plugin change updates the standalone behavior and inval
   assert.equal(result.code, 0, result.stderr);
   assert.equal(server.requests[0].body.thread.title, "original title");
   const runtime = join(checkout, "plugins", "codex", "scripts", "jieli_node.mjs");
-  writeFileSync(runtime, readFileSync(runtime, "utf8").replace("codexDesktopTitle(sessionId) || transcript.title", '"Changed plugin title" || transcript.title'));
+  writeFileSync(runtime, readFileSync(runtime, "utf8").replace("await codexThreadTitle(sessionId) || transcript.title", '"Changed plugin title" || transcript.title'));
   build();
   result = await run(home, server.url, [], {}, undefined, executable);
   assert.equal(result.code, 0, result.stderr);

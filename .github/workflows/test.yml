@@ -16,3 +16,18 @@ jobs:
       - run: node --test plugins/codex/tests/runtime-node.test.mjs
       - run: npm ci
       - run: npm run test:history
+
+  codex-titles:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --global @openai/codex@0.165.0
+      - run: node --test --test-name-pattern="Codex title metadata" plugins/codex/tests/runtime-node.test.mjs
+        env:
+          JIELI_CODEX_INTEGRATION: "1"

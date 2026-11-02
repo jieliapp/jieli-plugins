@@ -27,7 +27,6 @@ import {
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
-const hasSqlite3 = spawnSync("sqlite3", ["--version"], { encoding: "utf8" }).status === 0;
 
 function pluginBinFiles() {
   const binDir = join(pluginRoot, "bin");
@@ -152,36 +151,64 @@ test("builds Codex payload from JSONL while redacting and skipping private items
   assert.doesNotMatch(raw, /sk-ant-secret-value|abc\.def\.ghi|tool\.secret|tool-secret|developer instructions|private reasoning|encrypted/);
 });
 
-test("uses Codex Desktop title metadata when it updates after thread creation", { skip: !hasSqlite3 }, async () => {
+test("Codex title metadata follows configured storage without sqlite3 or tag exceptions", {
+  skip: process.env.JIELI_CODEX_INTEGRATION !== "1",
+}, async () => {
+  const { DatabaseSync } = await import("node:sqlite");
   const tmp = makeTempDir();
-  const appDbDir = join(tmp, "Library", "Application Support", "Codex", "sqlite");
-  mkdirSync(appDbDir, { recursive: true });
-  const stateDb = join(appDbDir, "state_5.sqlite");
-  const setup = spawnSync("sqlite3", [
-    stateDb,
-    [
-      "create table threads (id text primary key, title text not null);",
-      "insert into threads (id, title) values ('codex-delayed-title', '完善 Neo 子代理租约转发');",
-    ].join("\n"),
-  ], { encoding: "utf8" });
-  assert.equal(setup.status, 0, setup.stderr);
-
-  const transcript = join(tmp, "rollout-2026-06-08T00-00-00-codex-delayed-title.jsonl");
+  const codexHome = join(tmp, "codex-data");
+  const sqliteHome = join(tmp, "configured-db");
+  const sessionDir = join(codexHome, "sessions", "2026", "11", "02");
+  mkdirSync(sessionDir, { recursive: true });
+  mkdirSync(sqliteHome);
+  writeFileSync(join(codexHome, "config.toml"), `sqlite_home = ${JSON.stringify(sqliteHome)}\n`);
+  const id = "00000000-0000-4000-8000-000000000001";
+  const stamp = "2026-11-02T00:00:00Z";
+  const transcript = join(sessionDir, `rollout-2026-11-02T00-00-00-${id}.jsonl`);
+  const internal = '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>';
+  const userMessage = (text) => ({ timestamp: stamp, type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } });
   writeJsonl(transcript, [
-    { type: "session_meta", payload: { id: "codex-delayed-title", cwd: "/Users/alice/work/jieli" } },
-    {
-      type: "response_item",
-      payload: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "这个thread https://jieli.app/threads/T-old 开头还是 instructions" }],
-      },
-    },
+    { timestamp: stamp, type: "session_meta", payload: { id, timestamp: stamp, cwd: tmp, originator: "codex_cli_rs", cli_version: "0.165.0", source: "cli", model_provider: "openai" } },
+    userMessage(internal),
+    userMessage("真实用户问题\n后续表格"),
   ]);
-
-  await withEnv({ HOME: tmp }, async () => {
-    const payload = await runtime.buildPayloadFromHook({ session_id: "codex-delayed-title", transcript_path: transcript }, "https://jieli.example.test");
-    assert.equal(payload.thread.title, "完善 Neo 子代理租约转发");
+  const index = join(codexHome, "session_index.jsonl");
+  writeJsonl(index, [{ id, thread_name: "用户重命名标题", updated_at: stamp }]);
+  const locator = spawnSync(process.platform === "win32" ? "where.exe" : "which", ["codex"], { encoding: "utf8" });
+  assert.equal(locator.status, 0, "Install @openai/codex to run the title integration test");
+  const cliDir = dirname(locator.stdout.trim().split(/\r?\n/)[0]);
+  const path = [cliDir, dirname(process.execPath)].join(process.platform === "win32" ? ";" : ":");
+  await withEnv({ CODEX_HOME: codexHome, CODEX_SQLITE_HOME: undefined, PATH: path }, async () => {
+    assert.notEqual(spawnSync("sqlite3", ["--version"]).status, 0, "integration PATH must not provide sqlite3");
+    const build = () => runtime.buildPayloadFromHook({ session_id: id, transcript_path: transcript }, "https://jieli.example.test", null, null, { includeSummaryStats: false });
+    const renamed = await build();
+    assert.equal(renamed.thread.title, "用户重命名标题");
+    assert.equal(renamed.thread.messages[0].content, internal);
+    const dbFile = readdirSync(sqliteHome).find((name) => /^state_\d+\.sqlite$/.test(name));
+    assert.ok(dbFile, "Codex must use configured SQLite storage");
+    const db = new DatabaseSync(join(sqliteHome, dbFile));
+    try {
+      // Populate the real Codex schema, then verify its public API supplies the title.
+      assert.equal(db.prepare("UPDATE threads SET title = ? WHERE id = ?").run(
+        "查到是下面这 4 个基础矩阵的文件日期轴仍截至 **2026-10-31**：\n\n| 后续表格", id,
+      ).changes, 1);
+      writeFileSync(index, "");
+      assert.equal((await build()).thread.title, "查到是下面这 4 个基础矩阵的文件日期轴仍截至 **2026-10-31**：");
+      db.prepare("UPDATE threads SET title = ? WHERE id = ?").run(internal, id);
+      writeJsonl(index, [{ id, thread_name: internal, updated_at: stamp }]);
+      assert.equal((await build()).thread.title, internal.slice(0, 80), "legitimate XML titles must survive formatting");
+      db.prepare("UPDATE threads SET title = ? WHERE id = ?").run("修复 OPENAI_API_KEY=sk-ant-secret-value\n后续", id);
+      writeJsonl(index, [{ id, thread_name: "修复 OPENAI_API_KEY=sk-ant-secret-value\n后续", updated_at: stamp }]);
+      assert.equal((await build()).thread.title, "修复 OPENAI_API_KEY=[REDACTED:openai-api-key]");
+      db.prepare("UPDATE threads SET title = '' WHERE id = ?").run(id);
+      writeFileSync(index, "");
+      assert.equal((await build()).thread.title, internal.slice(0, 80), "empty metadata must retain the transcript title without tag exceptions");
+    } finally { db.close(); }
+    await withEnv({ PATH: join(tmp, "missing-executables") }, async () => {
+      await assert.rejects(build(), /Codex title metadata/);
+    });
+    writeJsonl(transcript, [{ type: "session_meta", payload: { id: "00000000-0000-4000-8000-000000000002" } }]);
+    await assert.rejects(build(), /Codex title metadata/);
   });
 });
 
