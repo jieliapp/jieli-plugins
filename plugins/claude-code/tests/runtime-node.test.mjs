@@ -639,6 +639,42 @@ test("handles Claude model aliases, local command noise, loaded skills, and spli
   assert.doesNotMatch(raw, /Base directory|large-signature|<local-command-caveat>/);
 });
 
+test("excludes injected Claude user metadata while preserving human prompts, tool results, and compaction", async () => {
+  const reminder = "Skill /git-commit is already loaded above; instructions unchanged.";
+  for (const content of [reminder, [{ type: "text", text: reminder }]]) {
+    const tmp = makeTempDir();
+    const transcript = join(tmp, "session.jsonl");
+    writeJsonl(transcript, [
+      { type: "user", uuid: "u-request", origin: { kind: "human" }, promptSource: "typed", message: { role: "user", content: "稍微修改一下，再次提交，测试用。" } },
+      { type: "assistant", uuid: "a-skill", message: { role: "assistant", content: [{ type: "tool_use", id: "call-skill", name: "Skill", input: { skill: "git-commit" } }] } },
+      { type: "user", uuid: "u-result", isMeta: true, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "call-skill", content: "Skill loaded." }] } },
+      { type: "user", uuid: "u-reminder", isMeta: true, sourceToolUseID: "call-skill", message: { role: "user", content } },
+      { type: "assistant", uuid: "a-edit", message: { role: "assistant", content: [{ type: "tool_use", id: "call-edit", name: "Edit", input: { file_path: "review-demo.js", old_string: "1", new_string: "2" } }] } },
+      { type: "user", uuid: "u-quoted", origin: { kind: "human" }, promptSource: "typed", message: { role: "user", content } },
+      { type: "user", uuid: "u-compact", isMeta: true, isCompactSummary: true, message: { role: "user", content: "This session is being continued. Context summary." } },
+    ]);
+
+    const payload = await withEnv({ HOME: tmp }, () => runtime.buildPayloadFromHook(
+      { session_id: "cc-meta", transcript_path: transcript, cwd: tmp },
+      "https://jieli.example.test",
+      null,
+      { includeSummaryStats: false },
+    ));
+    const messages = payload.thread.messages;
+    assert.deepEqual(messages.filter((message) => message.role === "user").map((message) => message.message_id), ["u-request", "u-quoted"]);
+    const editIndex = messages.findIndex((message) => message.message_id === "a-edit");
+    assert.ok(editIndex > 0);
+    assert.equal(messages.slice(0, editIndex).findLast((message) => message.role === "user").content, "稍微修改一下，再次提交，测试用。");
+    assert.equal(messages.find((message) => message.message_id === "u-quoted").content, reminder);
+    const toolResult = messages.find((message) => message.message_id === "u-result");
+    assert.equal(toolResult.role, "tool");
+    assert.equal(toolResult.content[0].tool_use_id, "call-skill");
+    const compact = messages.find((message) => message.message_id === "u-compact");
+    assert.equal(compact.role, "assistant");
+    assert.equal(compact.content[0].name, "Compact");
+  }
+});
+
 test("renders compaction summaries as tool calls and renders Claude bash transcript tags", async () => {
   const tmp = makeTempDir();
   const fakeKey = `jieli_${"a".repeat(30)}`;

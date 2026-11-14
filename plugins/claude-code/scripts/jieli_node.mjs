@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runBlame } from './git_blame.mjs';
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -15,6 +16,8 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureSummaryStatsBaseline, summaryStatsForUpload } from "./summary_stats.mjs";
+
+import { collectGitEvidence } from "./git_provenance.mjs";
 
 const PROVIDER = "claude_code";
 const DEFAULT_BASE_URL = "https://jieli.app";
@@ -33,6 +36,7 @@ const SHELL_TOOL_NAMES = new Set(["Bash"]);
 const CONFIG_BASE_URL_ENV_NAMES = ["JIELI_BASE_URL", "CLAUDE_PLUGIN_OPTION_BASE_URL"];
 const CONFIG_API_KEY_ENV_NAMES = ["JIELI_API_KEY", "CLAUDE_PLUGIN_OPTION_API_KEY"];
 const HELPER_COMMANDS = {
+ "blame": { booleanOptions: [], needsApiKey: true },
   "read-thread": { booleanOptions: ["truncate-tool-results"], needsApiKey: true },
   "find-threads": { booleanOptions: [], needsApiKey: true },
   "handoff-info": { booleanOptions: [], needsApiKey: false },
@@ -73,6 +77,7 @@ export async function main(forcedCommand = "") {
     if (command === "sync") return await syncMain(args);
     if (command === "commit-trailer") return await commitTrailerMain(args);
     if (command === "read-thread") return await readThreadMain(args);
+    if (command === "blame") return await runBlame(createCommandRuntime("blame", args));
     if (command === "find-threads") return await findThreadsMain(args);
     if (command === "handoff-info") return handoffInfoMain(args);
     usage();
@@ -485,6 +490,7 @@ async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = nu
     provider: PROVIDER,
     repo: "",
     repo_url: repoUrlFromCwd(cwd),
+    ...collectGitEvidence({provider: PROVIDER, sessionId, cwd, messages, cacheDir: join(homeDir(), ".jieli", "git-provenance")}),
     branch,
     source_url: base ? `${base}/threads/${providerThreadId}` : "",
     labels: [],
@@ -544,6 +550,7 @@ async function parseTranscript(path, fallbackSessionId = "", imageUploader = nul
         role = "assistant";
       }
     }
+    if (role === "user" && entry.isMeta === true) continue;
 
     const bash = role === "user" && typeof content === "string" ? parseBashBlock(content) : null;
     if (bash && bash.kind === "output" && pendingBashIndex !== null && pendingBashIndex === messages.length - 1) {
@@ -560,6 +567,8 @@ async function parseTranscript(path, fallbackSessionId = "", imageUploader = nul
         content,
         message_id: messageId,
       };
+      const stamp = timestampMs(entry.timestamp);
+      if (stamp) item.timestamp_ms = stamp;
       if (message.usage && typeof message.usage === "object") item.usage = redactJson(message.usage);
       const protocolId = message.protocolMessageID || message.protocol_message_id;
       if (protocolId) item.protocol_message_id = protocolId;

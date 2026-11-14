@@ -46,3 +46,14 @@ node <resolved-skill-dir>/../../scripts/jieli_helper.mjs find-threads "<query>" 
 ## Output
 
 For search-only requests, return a concise ranked list. For content requests, read the selected result and summarize the match, key goals/decisions, relevant files/commands/verification, and open follow-ups. Redact secrets.
+
+## Git provenance and Agent Blame
+
+When the question concerns why code exists or which conversation produced a commit, query the local repository directly:
+
+```bash
+node <resolved-skill-dir>/../../scripts/jieli_helper.mjs blame --commit <sha> --cwd <repository>
+node <resolved-skill-dir>/../../scripts/jieli_helper.mjs blame --line <path>:<start>-<end> --cwd <repository>
+```
+
+Use `execution` only for a verified exact-SHA executor; `sources` describes patch-equivalent origins and may be ambiguous. Preserve conflicts. Inspect the linked intent timeline and thread before explaining a decision. Original line ranges can be disjoint: do not fill gaps or treat patch-equivalent sources as exact line matches. Report `uncommitted_lines`, `line_mapping_unavailable`, `mirror_unavailable`, `attribution_pending`, and `repo_sync_requires_pro` explicitly. Never infer a missing link from matching titles or file names.

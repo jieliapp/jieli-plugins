@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runBlame } from './git_blame.mjs';
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -18,6 +19,8 @@ import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as zlib from "node:zlib";
 import { captureSummaryStatsBaseline, summaryStatsForUpload } from "./summary_stats.mjs";
+
+import { collectGitEvidence } from "./git_provenance.mjs";
 
 const PROVIDER = "codex";
 const DEFAULT_BASE_URL = "https://jieli.app";
@@ -49,6 +52,7 @@ const SHELL_TOOL_NAMES = new Set([
 const CONFIG_BASE_URL_ENV_NAMES = ["JIELI_BASE_URL"];
 const CONFIG_API_KEY_ENV_NAMES = ["JIELI_API_KEY"];
 const HELPER_COMMANDS = {
+ "blame": { booleanOptions: [], needsApiKey: true },
   "read-thread": { booleanOptions: ["truncate-tool-results"], needsApiKey: true },
   "find-threads": { booleanOptions: [], needsApiKey: true },
   "handoff-info": { booleanOptions: [], needsApiKey: false },
@@ -91,6 +95,7 @@ export async function main(forcedCommand = "") {
     if (command === "archive-sync") return await archiveSyncMain(args);
     if (command === "commit-trailer") return commitTrailerMain(args);
     if (command === "read-thread") return await readThreadMain(args);
+    if (command === "blame") return await runBlame(createCommandRuntime("blame", args));
     if (command === "find-threads") return await findThreadsMain(args);
     if (command === "handoff-info") return handoffInfoMain(args);
     usage();
@@ -546,6 +551,7 @@ async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = nu
     provider: PROVIDER,
     repo: "",
     repo_url: repoUrlFromCwd(cwd),
+    ...collectGitEvidence({provider: PROVIDER, sessionId, cwd, messages, cacheDir: join(homeDir(), ".jieli", "git-provenance")}),
     branch,
     source_url: `${base}/threads/${providerThreadId}`,
     labels: [],
@@ -594,6 +600,7 @@ async function parseTranscript(path, fallbackSessionId = "", imageUploader = nul
     }
     if (entry.type === "event_msg") {
       const item = await messageFromUserEvent(payload, lineNumber, imageUploader);
+      if (item && stampMs) item.timestamp_ms = stampMs;
       if (item && !isDuplicateUserEvent(messages, item)) {
         if (!title) title = textFromContent(item.content).trim().slice(0, 80);
         messages.push(item);
@@ -602,10 +609,12 @@ async function parseTranscript(path, fallbackSessionId = "", imageUploader = nul
     }
     if (entry.type !== "response_item") continue;
     const item = await messageFromResponseItem(payload, lineNumber, imageUploader, dataImageUploader);
+    if (item && !Array.isArray(item) && stampMs) item.timestamp_ms = stampMs;
     if (!item) continue;
     if (Array.isArray(item)) {
       for (const nested of item) {
         if (!nested) continue;
+        if (stampMs) nested.timestamp_ms = stampMs;
         if (nested.role === "user" && isEnvironmentContextText(textFromContent(nested.content))) continue;
         if (nested.role === "user" && !title) title = textFromContent(nested.content).trim().slice(0, 80);
         messages.push(nested);
@@ -814,7 +823,7 @@ function normalizeFunctionCall(payload, lineNumber) {
   const callId = String(payload.call_id || payload.id || `call-${lineNumber}`);
   const name = String(payload.name || "");
   if (!name) return null;
-  const inputValue = parseToolArguments(payload.arguments);
+  const inputValue = parseToolArguments(payload.arguments, name);
   return {
     role: "assistant",
     message_id: callId,
@@ -841,7 +850,7 @@ function normalizeFunctionOutput(payload, lineNumber) {
   const exitCode = exitCodeFromToolOutput(content);
   return {
     role: "tool",
-    message_id: callId,
+    message_id: `${callId}:result`,
     content: [{
       type: "tool_result",
       tool_use_id: callId,
@@ -854,10 +863,13 @@ function normalizeFunctionOutput(payload, lineNumber) {
   };
 }
 
-function parseToolArguments(value) {
+function parseToolArguments(value, name) {
   if (typeof value === "string") {
     try {
-      return redactJson(JSON.parse(value));
+      const parsed=JSON.parse(value);
+      // Numeric PTY handles are process metadata, unlike authentication session IDs.
+      if (name?.split('.').at(-1)==='write_stdin' && Number.isSafeInteger(parsed.session_id)) parsed.process_id=parsed.session_id;
+      return redactJson(parsed);
     } catch {
       return redactText(value);
     }

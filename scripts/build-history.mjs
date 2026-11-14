@@ -1,8 +1,16 @@
 import { build } from "esbuild";
-import { statSync } from "node:fs";
+import { statSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+for (const plugin of ['codex', 'claude-code']) {
+  writeFileSync(
+    new URL(`../plugins/${plugin}/scripts/git_blame.mjs`, import.meta.url),
+    readFileSync(new URL('./git-blame.mjs', import.meta.url), 'utf8')
+      .replace('./git-provenance.mjs', './git_provenance.mjs'),
+  );
+  copyFileSync(new URL('./git-provenance.mjs', import.meta.url), new URL(`../plugins/${plugin}/scripts/git_provenance.mjs`, import.meta.url));
+}
 const output = new URL("../dist/jieli-sync.mjs", import.meta.url);
 await build({
   absWorkingDir: root,

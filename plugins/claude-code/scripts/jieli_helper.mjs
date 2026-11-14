@@ -2,10 +2,10 @@
 import { main } from "./jieli_node.mjs";
 
 const [command, ...args] = process.argv.slice(2);
-const allowed = new Set(["read-thread", "find-threads", "handoff-info"]);
+const allowed = new Set(["read-thread", "find-threads", "handoff-info", "blame"]);
 
 if (!allowed.has(command)) {
-  console.error("Usage: jieli_helper.mjs <read-thread|find-threads|handoff-info> [args...]");
+  console.error("Usage: jieli_helper.mjs <read-thread|find-threads|blame|handoff-info> [args...]");
   process.exit(2);
 }
 
