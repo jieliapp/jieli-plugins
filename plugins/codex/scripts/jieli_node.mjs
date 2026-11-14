@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as zlib from "node:zlib";
+import { createInterface } from "node:readline";
 import { captureSummaryStatsBaseline, summaryStatsForUpload } from "./summary_stats.mjs";
 
 import { collectGitEvidence } from "./git_provenance.mjs";
@@ -519,7 +520,7 @@ async function buildPayloadFromHook(hookData, baseUrl = null, imageUploader = nu
     }
     if (typeof message.content === "string") message.content = blocks[0].text;
   }
-  const title = codexDesktopTitle(sessionId) || transcript.title || titleFromMessages(messages);
+  const title = await codexThreadTitle(sessionId) || transcript.title || titleFromMessages(messages);
   const thread = {
     id: providerThreadId,
     title,
@@ -602,7 +603,7 @@ async function parseTranscript(path, fallbackSessionId = "", imageUploader = nul
       const item = await messageFromUserEvent(payload, lineNumber, imageUploader);
       if (item && stampMs) item.timestamp_ms = stampMs;
       if (item && !isDuplicateUserEvent(messages, item)) {
-        if (!title) title = textFromContent(item.content).trim().slice(0, 80);
+        if (!title) title = titleFromContent(item.content);
         messages.push(item);
       }
       continue;
@@ -616,13 +617,13 @@ async function parseTranscript(path, fallbackSessionId = "", imageUploader = nul
         if (!nested) continue;
         if (stampMs) nested.timestamp_ms = stampMs;
         if (nested.role === "user" && isEnvironmentContextText(textFromContent(nested.content))) continue;
-        if (nested.role === "user" && !title) title = textFromContent(nested.content).trim().slice(0, 80);
+        if (nested.role === "user" && !title) title = titleFromContent(nested.content);
         messages.push(nested);
       }
       continue;
     }
     if (item.role === "user" && isEnvironmentContextText(textFromContent(item.content))) continue;
-    if (item.role === "user" && !title) title = textFromContent(item.content).trim().slice(0, 80);
+    if (item.role === "user" && !title) title = titleFromContent(item.content);
     messages.push(item);
   }
   return { id: sessionId || fallbackSessionId, cwd, branch, model, title, created_ms: createdMs, updated_ms: updatedMs || createdMs, messages };
@@ -1289,52 +1290,71 @@ function titleFromMessages(messages) {
   for (const message of messages) {
     if (message.role !== "user") continue;
     const text = textFromContent(message.content).trim();
-    if (text && text !== COMPACTION_PLACEHOLDER) return text.slice(0, 80);
+    if (text && text !== COMPACTION_PLACEHOLDER) {
+      const title = titleFromContent(text);
+      if (title) return title;
+    }
   }
   return "Codex session";
 }
 
-function codexDesktopTitle(sessionId) {
-  if (!sessionId) return "";
-  for (const candidate of codexDesktopTitleCandidates()) {
-    const title = readSqliteTitle(candidate.path, candidate.sql, sessionId);
-    if (title) return redactText(title).slice(0, 80);
-  }
-  return "";
+function titleFromContent(content) {
+  const text = textFromContent(content).trim();
+  return text.split(/\r?\n/, 1)[0].slice(0, 80);
 }
 
-function codexDesktopTitleCandidates() {
-  const appRoot = join(homedir(), "Library", "Application Support", "Codex", "sqlite");
-  return [
-    {
-      path: join(appRoot, "state_5.sqlite"),
-      sql: "select title from threads where id = ? limit 1",
-    },
-    {
-      path: join(appRoot, "codex-dev.db"),
-      sql: "select display_title from local_thread_catalog where thread_id = ? and missing_candidate = 0 order by source_updated_at desc limit 1",
-    },
-  ];
-}
-
-function readSqliteTitle(dbPath, sql, sessionId) {
-  if (!dbPath || !existsSync(dbPath)) return "";
-  const sqlite = spawnSync("sqlite3", ["-readonly", "-json", dbPath, bindSqliteString(sql, sessionId)], {
-    encoding: "utf8",
-    timeout: 1000,
+async function codexThreadTitle(sessionId) {
+  // Codex metadata is keyed by UUID; synthetic/exported identifiers have none.
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionId)) return "";
+  return new Promise((resolve, reject) => {
+    // Windows npm installations expose codex.cmd. Only this fixed command uses a
+    // shell; all thread data travels over stdin rather than command arguments.
+    const child = spawn("codex", ["app-server"], {
+      stdio: ["pipe", "pipe", "ignore"],
+      windowsHide: true,
+      shell: process.platform === "win32",
+    });
+    const lines = createInterface({ input: child.stdout });
+    let title;
+    const fail = (reason) => {
+      clearTimeout(timer);
+      lines.close();
+      if (child.pid) {
+        if (process.platform === "win32") {
+          spawnSync(join(dirname(process.env.ComSpec), "taskkill.exe"), ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+        } else child.kill();
+      }
+      reject(new Error(`Codex title metadata: ${reason}`));
+    };
+    const timer = setTimeout(() => fail("app-server timed out"), 5000);
+    const send = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
+    child.on("error", (error) => fail(error.message));
+    child.stdin.on("error", (error) => fail(error.message));
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      lines.close();
+      if (status !== 0 || title === undefined) {
+        reject(new Error("Codex title metadata: app-server exited before completing thread/read"));
+      } else resolve(title);
+    });
+    lines.on("line", (line) => {
+      let response;
+      try { response = JSON.parse(line); }
+      catch { fail("app-server returned invalid JSON"); return; }
+      if (response.id !== 1 && response.id !== 2) return;
+      if (response.error) { fail(redactText(response.error.message || "app-server request failed")); return; }
+      if (response.id === 1) {
+        send({ method: "initialized" });
+        send({ id: 2, method: "thread/read", params: { threadId: sessionId, includeTurns: false } });
+      } else {
+        const thread = response.result?.thread;
+        if (!thread || typeof thread.preview !== "string") { fail("thread/read returned invalid metadata"); return; }
+        title = titleFromContent(redactText(thread.name || thread.preview));
+        child.stdin.end();
+      }
+    });
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "jieli_sync", version: "1" } } });
   });
-  if (sqlite.status !== 0 || sqlite.error) return "";
-  try {
-    const rows = JSON.parse(sqlite.stdout || "[]");
-    const value = rows && rows[0] && Object.values(rows[0])[0];
-    return typeof value === "string" ? value.trim() : "";
-  } catch {
-    return "";
-  }
-}
-
-function bindSqliteString(sql, value) {
-  return sql.replace("?", `'${String(value).replace(/'/g, "''")}'`);
 }
 
 function timestampMs(value) {
