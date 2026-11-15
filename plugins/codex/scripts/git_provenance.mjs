@@ -16,7 +16,6 @@ import {
   resolve,
   dirname,
   relative,
-  isAbsolute,
   delimiter,
 } from "node:path";
 
@@ -44,33 +43,37 @@ export function remoteWithoutCredentials(raw) {
 function commandRepo(input, cwd) {
   const command = input.cmd ?? input.command;
   if (typeof command !== "string") return null;
-  // Reading HEAD after a successful commit does not change the commit evidence.
-  const parts = command
-    .replace(/\s*&&\s*git\s+rev-parse\s+HEAD\s*$/, "")
-    .split(/\s*&&\s*/);
-  if (parts.some((p) => !/^git\s/.test(p.trim()))) return null;
-  const cmd = parts.at(-1).trim();
-  // Accept literal multiline quotes; escaped quotes and expansions stay unsupported.
-  if (/[`$]/.test(cmd) || /\\["']/.test(cmd)) return null;
-  if (/[;|\n]/.test(cmd.replace(/"[^"]*"|'[^']*'/g, ""))) return null;
-  const tokens =
-    cmd
-      .match(/"[^"]*"|'[^']*'|[^\s]+/g)
-      ?.map((t) => t.replace(/^(['"])(.*)\1$/, "$2")) ?? [];
-  let dir = input.cwd || input.workdir || cwd;
-  let i = 1;
-  while (tokens[i] === "-C") {
-    if (!tokens[i + 1]) return null;
-    dir = resolve(dir, tokens[i + 1]);
-    i += 2;
+  // A bounded literal Git sequence, not a shell parser. Quoted newlines remain arguments.
+  if (/[`$\\]/.test(command)) return null;
+  const parts = [[]];
+  for (const token of command.match(/"[^"]*"|'[^']*'|&&|\n|[^\s;&|]+|[;&|]/g) ?? []) {
+    if (token === "&&" || token === "\n") {
+      if (parts.at(-1).length) parts.push([]);
+    } else {
+      if (/^[;&|]$/.test(token) || (/["']/.test(token) && !/^"[^"]*"$|^'[^']*'$/.test(token))) return null;
+      parts.at(-1).push(/^["']/.test(token) ? token.slice(1, -1) : token);
+    }
   }
-  if (
-    tokens[i] !== "commit" ||
-    tokens.includes("--dry-run") ||
-    tokens.includes("--help")
-  )
-    return null;
-  return { dir, amend: tokens.includes("--amend") };
+  let producing = null;
+  for (const tokens of parts.filter((part) => part.length)) {
+    if (tokens[0] !== "git") return null;
+    let dir = input.workdir || input.cwd || cwd;
+    let i = 1;
+    while (tokens[i] === "-C" || tokens[i] === "-c") {
+      if (!tokens[i + 1]) return null;
+      if (tokens[i] === "-C") dir = resolve(dir, tokens[i + 1]);
+      i += 2;
+    }
+    const action = tokens[i];
+    const args = tokens.slice(i + 1);
+    if (action === "commit" || action === "cherry-pick") {
+      if (producing || args.some((arg) => ["--dry-run", "--help", "-h", "--abort", "--quit", "--skip", "--no-commit", "-n"].includes(arg))) return null;
+      producing = {dir, amend: action === "commit" && args.includes("--amend")};
+    } else if (producing) {
+      if (action !== "rev-parse" || args.join(" ") !== "HEAD" || dir !== producing.dir) return null;
+    } else if (action !== "add" && !(action === "diff" && args.join(" ") === "--cached --check")) return null;
+  }
+  return producing;
 }
 function blocks(message) {
   return Array.isArray(message.content) ? message.content : [];
@@ -83,6 +86,35 @@ function completed(block) {
     block.run?.status === "completed" &&
     (block.run.result?.exitCode == null || block.run.result.exitCode === 0)
   );
+}
+
+// Resolve the nearest Git boundary, including nested repositories and linked worktrees.
+// Cache directory walks so a long transcript reads metadata once per repository root.
+function editRepositories() {
+  const directories = new Map();
+  return (directory) => {
+    const visited = [];
+    let context = null;
+    for (let dir = resolve(directory); ; dir = dirname(dir)) {
+      if (directories.has(dir)) {
+        context = directories.get(dir);
+        break;
+      }
+      visited.push(dir);
+      if (existsSync(join(dir, ".git"))) {
+        const root = git(dir, ["rev-parse", "--show-toplevel"]);
+        const remote = git(dir, ["config", "--get", "remote.origin.url"]);
+        if (root) context = {
+          git_root: resolve(dir, relative(realpathSync(dir), root)),
+          git_remote_url: remoteWithoutCredentials(remote ?? ""),
+        };
+        break;
+      }
+      if (dirname(dir) === dir) break;
+    }
+    for (const dir of visited) directories.set(dir, context);
+    return context;
+  };
 }
 
 // Sample repository metadata and object directories once, never every object or source file.
@@ -185,42 +217,7 @@ export function collectGitEvidence({
   const root = git(cwd, ["rev-parse", "--show-toplevel"]);
   if (remote) cache.git_remote_url = remoteWithoutCredentials(remote);
   if (root) {
-    cache.physical_root = root;
     cache.git_root = resolve(cwd, relative(realpathSync(cwd), root));
-  }
-  // Keep one path spelling across the snapshot; macOS may expose /var through /private/var.
-  if (
-    cache.physical_root &&
-    cache.git_root &&
-    cache.physical_root !== cache.git_root
-  ) {
-    for (const message of messages)
-      for (const block of blocks(message)) {
-        const input = block.input;
-        if (!input || typeof input !== "object") continue;
-        for (const field of ["file_path", "path", "cwd", "workdir"]) {
-          const value = input[field];
-          if (typeof value !== "string" || !isAbsolute(value)) continue;
-          const suffix = relative(cache.physical_root, value);
-          if (suffix !== ".." && !suffix.startsWith("../"))
-            input[field] = resolve(cache.git_root, suffix);
-        }
-        if (typeof input.patch_text === "string")
-          input.patch_text = input.patch_text.replace(
-            /^(\*\*\* (?:(?:Add|Update|Delete) File: |Move to: ))(.+)$/gm,
-            (_match, prefix, path) => {
-              const suffix = relative(cache.physical_root, path);
-              return (
-                prefix +
-                (isAbsolute(path) &&
-                suffix !== ".." &&
-                !suffix.startsWith("../")
-                  ? resolve(cache.git_root, suffix)
-                  : path)
-              );
-            },
-          );
-      }
   }
   const calls = new Map();
   const completions = new Map();
@@ -252,6 +249,31 @@ export function collectGitEvidence({
         output: (prior?.output ?? "") + output,
       });
     }
+  const repositoryFor = editRepositories();
+  for (const { block: tool } of calls.values()) {
+    const input = tool.input ?? {};
+    let paths;
+    switch (name(tool)) {
+      case "Edit": case "edit_file": case "Write": case "write_file":
+      case "create_file": case "MultiEdit":
+        paths = [input.file_path ?? input.path];
+        break;
+      case "apply_patch":
+        paths = [...String(input.patch_text ?? "").matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File: |Move to: )(.+)$/gm)].map((m) => m[1]);
+        break;
+      default: continue;
+    }
+    const terminal = completions.get(tool.id);
+    if (!terminal || !completed(terminal.block)) continue;
+    const contexts = new Map();
+    for (const path of paths) {
+      if (typeof path !== "string" || !path) continue;
+      const directory = dirname(resolve(input.workdir || input.cwd || cwd, path));
+      const context = repositoryFor(directory);
+      if (context) contexts.set(context.git_root, context);
+    }
+    tool.git_repositories = [...contexts.values()];
+  }
   const failureState = failureStates();
   const previousByRemote = new Map();
   const positions = new Map(messages.map((m, i) => [m.message_id, i]));

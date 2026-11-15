@@ -7,6 +7,8 @@ import {
   readFileSync,
   renameSync,
   mkdirSync,
+  realpathSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -109,6 +111,112 @@ const result = (id, output, exitCode = 0) => ({
       run: { status: "completed", result: { output, exitCode } },
     },
   ],
+});
+
+test("structured edits retain their actual worktree and nested repository ownership", (t) => {
+  const f = fixture(t);
+  f.commit("base");
+  const linked = join(f.temp, "linked");
+  f.git("-C", f.cwd, "worktree", "add", "-b", "linked", linked);
+  const nested = join(f.cwd, "plugins");
+  f.git("init", nested);
+  f.git("-C", nested, "remote", "add", "origin", "git@github.com:acme/plugins.git");
+  const edit = (id, path) => ({
+    role: "assistant", message_id: id,
+    content: [{type: "tool_use", id, name: "functions.apply_patch", input: {patch_text: `*** Begin Patch\n*** Update File: ${path}\n@@\n-base\n+changed\n*** End Patch`}}],
+  });
+  const messages = [edit("linked", join(linked, "file.txt")), result("linked", "Success"), edit("nested", join(nested, "deleted-dir/file.txt")), result("nested", "Success")];
+  const collect = () => collectGitEvidence({provider: "codex", sessionId: "worktrees", cwd: f.cwd, messages, cacheDir: join(f.temp, "contexts-cache")});
+  collect();
+  assert.equal(messages[0].content[0].input.patch_text.includes(join(linked, "file.txt")), true, "preserve original paths");
+  assert.deepEqual(messages[0].content[0].git_repositories, [{git_root: linked, git_remote_url: "git@github.com:acme/project.git"}]);
+  assert.deepEqual(messages[2].content[0].git_repositories, [{git_root: nested, git_remote_url: "git@github.com:acme/plugins.git"}]);
+  const first = JSON.stringify(messages);
+  collect();
+  assert.equal(JSON.stringify(messages), first, "repeated capture is stable");
+});
+
+test("a mixed patch retains an unconfigured nested Git boundary", (t) => {
+  const f = fixture(t);
+  const nested = join(f.cwd, "nested");
+  f.git("init", nested);
+  const tool = {type: "tool_use", id: "mixed", name: "apply_patch", input: {patch_text: `*** Begin Patch\n*** Add File: ${f.cwd}/a.txt\n+outer\n*** Add File: ${nested}/b.txt\n+nested\n*** End Patch`}};
+  const messages = [{role: "assistant", message_id: "mixed", content: [tool]}, result("mixed", "Success")];
+  collectGitEvidence({provider: "codex", sessionId: "mixed", cwd: f.cwd, messages, cacheDir: join(f.temp, "mixed-cache")});
+  assert.deepEqual(tool.git_repositories, [
+    {git_root: f.cwd, git_remote_url: "git@github.com:acme/project.git"},
+    {git_root: nested, git_remote_url: ""},
+  ]);
+});
+
+test("symlink session paths do not rewrite original physical tool inputs", (t) => {
+  const f = fixture(t);
+  const alias = join(f.temp, "alias");
+  symlinkSync(f.cwd, alias);
+  const input = {file_path: join(realpathSync(f.cwd), "file.txt"), old_string: "before", new_string: "after"};
+  const original = JSON.stringify(input);
+  const tool = {type: "tool_use", id: "edit", name: "Edit", input};
+  collectGitEvidence({provider: "codex", sessionId: "alias", cwd: alias, messages: [{role: "assistant", message_id: "edit", content: [tool]}, result("edit", "Success")], cacheDir: join(f.temp, "alias-cache")});
+  assert.equal(JSON.stringify(input), original);
+  assert.equal(tool.git_repositories[0].git_root, realpathSync(f.cwd));
+});
+
+for (const conflict of [false, true]) test(`captures cherry-pick${conflict ? " after conflict resolution" : " directly"} at the producing tool`, (t) => {
+  const f = fixture(t);
+  const base = f.commit("base");
+  f.git("-C", f.cwd, "checkout", "-b", "feature");
+  const source = f.commit("feature");
+  f.git("-C", f.cwd, "checkout", "-b", "cloud", base.sha);
+  if (conflict) f.commit("cloud");
+  const pick = spawnSync("git", ["cherry-pick", source.sha], {cwd: f.cwd, encoding: "utf8"});
+  assert.equal(pick.status, conflict ? 1 : 0, pick.stderr);
+  const initial = call("pick", f.cwd);
+  initial.content[0].input.cmd = `git cherry-pick ${source.sha}`;
+  const messages = [user("request"), initial, result("pick", pick.stdout, pick.status)];
+  let tool = "pick";
+  if (conflict) {
+    assert.equal(f.collect(messages).commits.length, 0, "the failed initial pick is not evidence");
+    writeFileSync(join(f.cwd, "file.txt"), "resolved feature and cloud\n");
+    const command = "git add file.txt\ngit diff --cached --check\ngit -c core.editor=true cherry-pick --continue";
+    const continued = spawnSync("/bin/sh", ["-c", command], {cwd: f.cwd, encoding: "utf8"});
+    assert.equal(continued.status, 0, continued.stderr);
+    const finish = call("continue", f.cwd);
+    finish.content[0].input.cmd = command;
+    messages.push(finish, result("continue", `Process running with session ID 123\n${continued.stdout}`));
+    assert.equal(f.collect(messages).commits.length, 0, "a running continuation is not yet evidence");
+    const poll = call("poll", f.cwd);
+    poll.content[0].name = "functions.write_stdin";
+    poll.content[0].input = {process_id: 123, chars: ""};
+    messages.push(poll, result("poll", "Process exited with code 0\n"));
+    tool = "continue";
+  }
+  const captured = f.collect(messages);
+  assert.equal(captured.commits.length, 1);
+  assert.equal(captured.commits[0].commit_sha, f.git("-C", f.cwd, "rev-parse", "HEAD"));
+  assert.equal(captured.commits[0].commit_tool_use_id, tool);
+  assert.equal(captured.commits[0].start_message_id, "request");
+  assert.equal(captured.commits[0].end_message_id, `${conflict ? "poll" : tool}:result`);
+});
+
+for (const mode of ["--no-commit", "--abort", "multiple"]) test(`cherry-pick ${mode} does not establish one execution`, (t) => {
+  const f = fixture(t);
+  const base = f.commit("base");
+  f.git("-C", f.cwd, "checkout", "-b", "feature");
+  const first = f.commit("first");
+  const second = f.commit("second");
+  f.git("-C", f.cwd, "checkout", "-b", "cloud", base.sha);
+  if (mode === "--abort") {
+    f.commit("conflicting cloud change");
+    const conflict = spawnSync("git", ["cherry-pick", first.sha], {cwd: f.cwd, encoding: "utf8"});
+    assert.equal(conflict.status, 1);
+  }
+  const command = mode === "multiple" ? `git cherry-pick ${first.sha} ${second.sha}`
+    : mode === "--abort" ? "git cherry-pick --abort" : `git cherry-pick --no-commit ${first.sha}`;
+  const executed = spawnSync("/bin/sh", ["-c", command], {cwd: f.cwd, encoding: "utf8"});
+  assert.equal(executed.status, 0, executed.stderr);
+  const candidate = call("pick", f.cwd);
+  candidate.content[0].input.cmd = command;
+  assert.equal(f.collect([user("request"), candidate, result("pick", executed.stdout)]).commits.length, 0);
 });
 
 for (const tool of ["Bash", "functions.exec_command"])
