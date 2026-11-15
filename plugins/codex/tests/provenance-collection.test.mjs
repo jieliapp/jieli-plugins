@@ -251,6 +251,91 @@ for (const tool of ["Bash", "functions.exec_command"])
     assert.equal(captured.commits[1].end_message_id, "c2:result");
   });
 
+test("captures a commit surrounded by Git checks and staging", async (t) => {
+  const f = fixture(t);
+  const first = f.commit("base");
+  writeFileSync(join(f.cwd, "file.txt"), "updated\n");
+  const command = 'git -C repo diff --check\ngit -C repo status --short\ngit -C repo add file.txt\ngit -C repo diff --cached --stat\ngit -c core.quotePath=false -C repo commit -m updated';
+  const executed = spawnSync("/bin/sh", ["-c", command], {cwd: f.temp, encoding: "utf8"});
+  assert.equal(executed.status, 0, executed.stderr);
+  const candidate = call("combined", f.cwd);
+  candidate.content[0].input.cmd = command;
+  candidate.content[0].input.workdir = f.temp;
+  const messages = [user("u1"), call("base", f.cwd), result("base", first.output), user("u2"), candidate, result("combined", executed.stdout)];
+  await traceGit(f, (trace) => {
+    const captured = f.collect(messages);
+    assert.equal(captured.commits.length, 2);
+    assert.equal(captured.commits[1].commit_sha, f.git("-C", f.cwd, "rev-parse", "HEAD"));
+    assert.equal(captured.commits[1].commit_tool_use_id, "combined");
+    assert.equal(captured.commits[1].start_message_id, "u2");
+    assert.equal(captured.commits[1].end_message_id, "combined:result");
+    trace.clear();
+    assert.deepEqual(f.collect(messages), captured);
+    assert.equal(trace.calls().filter((args) => args.includes("--verify") || args[0] === "show" || args[0] === "diff-tree" || args[0] === "patch-id").length, 0, "unchanged evidence does not revalidate Git objects");
+  });
+});
+
+for (const finish of ["success", "wrong session", "failure"]) test(`cherry-pick with piped checks and repeated polls: ${finish}`, (t) => {
+  const f = fixture(t);
+  const base = f.commit("base");
+  f.git("-C", f.cwd, "checkout", "-b", "feature");
+  const source = f.commit("feature");
+  f.git("-C", f.cwd, "checkout", "-b", "cloud", base.sha);
+  const command = `git cherry-pick ${source.sha} && git diff HEAD~ HEAD | head -24 && git status --short > check.log 2>&1`;
+  const executed = spawnSync("/bin/sh", ["-c", command], {cwd: f.cwd, encoding: "utf8"});
+  assert.equal(executed.status, 0, executed.stderr);
+  const candidate = call("pick", f.cwd);
+  candidate.content[0].input.cmd = command;
+  const messages = [user("request"), candidate, result("pick", "Process running with session ID 123\n")];
+  assert.equal(f.collect(messages).commits.length, 0, "a success header alone does not establish shell completion");
+  const progress = call("progress", f.cwd);
+  progress.content[0].name = "functions.write_stdin";
+  progress.content[0].input = {process_id: 123, chars: ""};
+  messages.push(progress, result("progress", `Process running with session ID 123\n${executed.stdout}`));
+  assert.equal(f.collect(messages).commits.length, 0, "even a success header in a later poll needs completion");
+  const poll = call("poll", f.cwd);
+  poll.content[0].name = "functions.write_stdin";
+  poll.content[0].input = {process_id: finish === "wrong session" ? 999 : 123, chars: ""};
+  const exitCode = finish === "failure" ? 1 : 0;
+  messages.push(poll, result("poll", `Process exited with code ${exitCode}\n`, exitCode));
+  const captured = f.collect(messages);
+  if (finish !== "success") {
+    assert.equal(captured.commits.length, 0, "unrelated or failed completions cannot confirm the Git operation");
+    return;
+  }
+  assert.equal(captured.commits.length, 1);
+  assert.equal(captured.commits[0].commit_sha, f.git("-C", f.cwd, "rev-parse", "HEAD"));
+  assert.equal(captured.commits[0].commit_tool_use_id, "pick");
+  assert.equal(captured.commits[0].start_message_id, "request");
+  assert.equal(captured.commits[0].end_message_id, "poll:result");
+});
+
+test("captures the cherry-pick, search, and Go test command shape with real tools", (t) => {
+  for (const tool of ["rg", "go"]) {
+    if (spawnSync(tool, [tool === "go" ? "version" : "--version"]).status !== 0) {
+      t.skip(`${tool} is needed for this integration check`);
+      return;
+    }
+  }
+  const f = fixture(t);
+  const base = f.commit("base");
+  f.git("-C", f.cwd, "checkout", "-b", "feature");
+  const source = f.commit("feature");
+  f.git("-C", f.cwd, "checkout", "-b", "cloud", base.sha);
+  writeFileSync(join(f.cwd, "go.mod"), "module example.test/provenance\n\ngo 1.20\n");
+  writeFileSync(join(f.cwd, "example_test.go"), "package provenance\nimport \"testing\"\nfunc TestExample(t *testing.T) {}\n");
+  const command = `git cherry-pick ${source.sha} && rg -n feature file.txt | head -24 && go test ./... -count=1 > check.log 2>&1`;
+  const executed = spawnSync("/bin/sh", ["-c", command], {cwd: f.cwd, encoding: "utf8"});
+  assert.equal(executed.status, 0, executed.stderr + readFileSync(join(f.cwd, "check.log"), "utf8"));
+  const candidate = call("pick", f.cwd);
+  candidate.content[0].input.cmd = command;
+  const messages = [user("request"), candidate, result("pick", executed.stdout)];
+  const captured = f.collect(messages);
+  assert.equal(captured.commits[0]?.commit_sha, f.git("-C", f.cwd, "rev-parse", "HEAD"));
+  messages[2] = result("pick", executed.stdout, 1);
+  assert.equal(f.collect(messages).commits.length, 0, "failed combined checks do not confirm execution");
+});
+
 for (const scenario of [
   {
     name: "failed commit followed by a printed old SHA after an escaped quote",
@@ -267,9 +352,38 @@ for (const scenario of [
     stage: true,
     command: () => 'git commit -m second && git commit --allow-empty -m third && git rev-parse HEAD',
   },
+  {
+    name: "a commit piped into an output filter",
+    stage: true,
+    command: () => 'git commit -m second | head -24',
+  },
+  {
+    name: "an arbitrary output command after a failed commit",
+    stage: false,
+    command: (sha) => `git commit -m second\nprintf '[main ${sha.slice(0, 8)}] old'`,
+  },
+  {
+    name: "head replaying an old summary after a failed commit",
+    stage: false,
+    command: () => "git commit -m second\nhead -24 old.log",
+    replayOldSummary: true,
+  },
+  ...["-q", "--qui", "-aq", "--porcelain", "--dry"].map((option) => ({
+    name: `a ${option} commit followed by an old summary`,
+    stage: true,
+    command: () => `git commit ${option} -m second && head -24 old.log`,
+    replayOldSummary: true,
+  })),
+  {
+    name: "a redirected commit with the redirect between its message option and value",
+    stage: true,
+    command: () => "git commit -m > actual.log second && head -1 old.log",
+    replayOldSummary: true,
+  },
 ]) test(`rejects ${scenario.name}`, (t) => {
   const f = fixture(t);
   const first = f.commit("first");
+  if (scenario.replayOldSummary) writeFileSync(join(f.cwd, "old.log"), first.output + "\n");
   if (scenario.stage) {
     writeFileSync(join(f.cwd, "file.txt"), "second\n");
     f.git("-C", f.cwd, "add", "file.txt");

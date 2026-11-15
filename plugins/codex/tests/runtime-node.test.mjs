@@ -367,7 +367,7 @@ test("normalizes Codex apply_patch, exec_command, and nonzero tool exits", async
 
   const payload = await runtime.buildPayloadFromHook({ session_id: "codex-tools", transcript_path: transcript }, "https://jieli.example.test");
   const patchUse = payload.thread.messages[1].content[0];
-  assert.deepEqual(patchUse, { type: "tool_use", id: "call-patch", name: "apply_patch", input: { patch_text: patchText } });
+  assert.deepEqual(patchUse, { type: "tool_use", id: "call-patch", name: "apply_patch", input: { patch_text: patchText }, git_repositories: [] });
   const patchResult = payload.thread.messages[2].content[0];
   assert.equal(patchResult.tool_use_id, "call-patch");
   assert.equal(patchResult.content, "");

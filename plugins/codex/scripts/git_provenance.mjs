@@ -43,20 +43,26 @@ export function remoteWithoutCredentials(raw) {
 function commandRepo(input, cwd) {
   const command = input.cmd ?? input.command;
   if (typeof command !== "string") return null;
-  // A bounded literal Git sequence, not a shell parser. Quoted newlines remain arguments.
+  // A bounded literal sequence, not a shell parser. Quoted newlines remain arguments.
   if (/[`$\\]/.test(command)) return null;
-  const parts = [[]];
-  for (const token of command.match(/"[^"]*"|'[^']*'|&&|\n|[^\s;&|]+|[;&|]/g) ?? []) {
-    if (token === "&&" || token === "\n") {
-      if (parts.at(-1).length) parts.push([]);
+  const parts = [{tokens: [], piped: false, separator: ""}];
+  for (const token of command.match(/"[^"]*"|'[^']*'|&&|\|\||\n|2>&1|>>?|[^\s;&|<>]+|[;&|<>]/g) ?? []) {
+    if (token === "&&" || token === "\n" || token === "|") {
+      if (token === "|") parts.at(-1).piped = true;
+      if (parts.at(-1).tokens.length) parts.push({tokens: [], piped: token === "|", separator: token});
     } else {
-      if (/^[;&|]$/.test(token) || (/["']/.test(token) && !/^"[^"]*"$|^'[^']*'$/.test(token))) return null;
-      parts.at(-1).push(/^["']/.test(token) ? token.slice(1, -1) : token);
+      if (/^[;&<]$|^\|\|$/.test(token) || (/["']/.test(token) && !/^"[^"]*"$|^'[^']*'$/.test(token))) return null;
+      parts.at(-1).tokens.push(/^["']/.test(token) ? token.slice(1, -1) : token);
     }
   }
   let producing = null;
-  for (const tokens of parts.filter((part) => part.length)) {
-    if (tokens[0] !== "git") return null;
+  for (const {tokens, piped, separator} of parts.filter((part) => part.tokens.length)) {
+    // Later output is evidence only when these checks depend on the producer succeeding.
+    if (producing && separator !== "&&" && separator !== "|") return null;
+    if (tokens[0] !== "git") {
+      if (producing && (["rg", "head"].includes(tokens[0]) || (tokens[0] === "go" && tokens[1] === "test"))) continue;
+      return null;
+    }
     let dir = input.workdir || input.cwd || cwd;
     let i = 1;
     while (tokens[i] === "-C" || tokens[i] === "-c") {
@@ -67,11 +73,21 @@ function commandRepo(input, cwd) {
     const action = tokens[i];
     const args = tokens.slice(i + 1);
     if (action === "commit" || action === "cherry-pick") {
-      if (producing || args.some((arg) => ["--dry-run", "--help", "-h", "--abort", "--quit", "--skip", "--no-commit", "-n"].includes(arg))) return null;
+      if (producing || piped || args.some((arg) => [">", ">>", "2>&1"].includes(arg))) return null;
+      // Recognize normal producing modes explicitly; quiet/status/help variants have no usable summary.
+      for (let j = 0; j < args.length; j++) {
+        const arg = args[j];
+        if (action === "commit" && ["-m", "--message", "-F", "--file", "-am"].includes(arg)) {
+          if (!args[++j]) return null;
+          continue;
+        }
+        if (action === "commit" && (/^(?:-m.|-F.|--message=.|--file=.)/.test(arg) ||
+          ["--amend", "--no-edit", "--allow-empty", "--allow-empty-message", "-a", "--all", "-s", "--signoff", "-v", "--verbose", "--no-verify"].includes(arg))) continue;
+        if (action === "cherry-pick" && ["--continue", "-x"].includes(arg)) continue;
+        if (arg.startsWith("-")) return null;
+      }
       producing = {dir, amend: action === "commit" && args.includes("--amend")};
-    } else if (producing) {
-      if (action !== "rev-parse" || args.join(" ") !== "HEAD" || dir !== producing.dir) return null;
-    } else if (action !== "add" && !(action === "diff" && args.join(" ") === "--cached --check")) return null;
+    } else if (!["diff", "status", "rev-parse"].includes(action) && !(action === "add" && !producing)) return null;
   }
   return producing;
 }
