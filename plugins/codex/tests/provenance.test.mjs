@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, renameSync, rmSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import * as codex from '../scripts/jieli_node.mjs';
 import * as claude from '../../claude-code/scripts/jieli_node.mjs';
@@ -33,4 +34,43 @@ for (const provider of ['codex','claude']) test(`${provider}: capture root commi
   renameSync(cwd,join(temp,'removed'));
   const second=await build();assert.deepEqual(second.commits,first.commits,'captured success must survive local object/workspace removal');
  });
+});
+
+for (const provider of ['codex', 'claude-code']) test(`${provider}: standalone plugin captures a literal batch without source dependencies`, async (t) => {
+  const temp = mkdtempSync(join(tmpdir(), 'jieli-standalone-provenance-'));
+  t.after(() => rmSync(temp, {recursive:true, force:true}));
+  const cwd = join(temp, 'repo space');
+  const git = (...args) => {
+    const r = spawnSync('git', args, {encoding:'utf8'});
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  git('init', '-b', 'main', cwd);
+  git('-C', cwd, 'config', 'user.name', 'Test');
+  git('-C', cwd, 'config', 'user.email', 'test@example.test');
+  git('-C', cwd, 'remote', 'add', 'origin', 'git@github.com:acme/standalone.git');
+  const command = "git -C ../repo\\ space commit --allow-empty -m done && git -C ../repo\\ space commit --allow-empty -m 'then'";
+  const executed = spawnSync('/bin/sh', ['-c', command], {cwd, encoding:'utf8'});
+  assert.equal(executed.status, 0, executed.stderr);
+  const shas = [git('-C', cwd, 'rev-parse', 'HEAD^'), git('-C', cwd, 'rev-parse', 'HEAD')];
+  const standalone = join(temp, 'plugin');
+  cpSync(fileURLToPath(new URL(`../../${provider}/scripts`, import.meta.url)), standalone, {recursive:true});
+  const runtime = await import(pathToFileURL(join(standalone, 'jieli_node.mjs')));
+  const transcript = join(temp, 'session.jsonl');
+  const entries = provider === 'codex' ? [
+    {type:'session_meta', payload:{id:'batch', cwd}},
+    {type:'response_item', payload:{type:'function_call', call_id:'call', name:'exec_command', arguments:JSON.stringify({cmd:command, workdir:cwd})}},
+    {type:'response_item', payload:{type:'function_call_output', call_id:'call', output:`Process exited with code 0\nFinal output:\n${executed.stdout}`}},
+  ] : [
+    {type:'assistant', uuid:'call-message', sessionId:'batch', cwd, message:{role:'assistant', content:[{type:'tool_use', id:'call', name:'Bash', input:{command}}]}},
+    {type:'user', uuid:'result-message', sessionId:'batch', cwd, message:{role:'user', content:[{type:'tool_result', tool_use_id:'call', content:executed.stdout}]}},
+  ];
+  writeFileSync(transcript, entries.map(JSON.stringify).join('\n'));
+  await withEnv({HOME:temp}, async () => {
+    const payload = await runtime.buildPayloadFromHook({transcript_path:transcript, session_id:'batch', cwd}, 'https://jieli.example.test', null,
+      ...(provider === 'codex' ? [null, {includeSummaryStats:false}] : [{includeSummaryStats:false}]));
+    assert.deepEqual(payload.commits.map(c => c.commit_sha), shas);
+    assert.ok(payload.commits.every(c => c.commit_tool_use_id === 'call' && c.start_message_id === c.commit_message_id));
+    assert.equal(payload.commits_complete, true);
+  });
 });

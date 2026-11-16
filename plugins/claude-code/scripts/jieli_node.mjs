@@ -18,6 +18,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureSummaryStatsBaseline, summaryStatsForUpload } from "./summary_stats.mjs";
 
 import { collectGitEvidence } from "./git_provenance.mjs";
+import { injectTrailer } from "./shell_commands.mjs";
 
 const PROVIDER = "claude_code";
 const DEFAULT_BASE_URL = "https://jieli.app";
@@ -31,7 +32,6 @@ const HANDOFF_CONTEXT_FILE = "claude-handoff-context.json";
 const SETTINGS_FILE_NAME = "settings.json";
 const TRAILER_KEY = "Jieli-Thread";
 const HANDOFF_CONTEXT_ENV = "JIELI_HANDOFF_CONTEXT_B64";
-const AMBIGUOUS_TOKENS = ["||", ";", "\n", "$(", "`", "<<", "|"];
 const SHELL_TOOL_NAMES = new Set(["Bash"]);
 const CONFIG_BASE_URL_ENV_NAMES = ["JIELI_BASE_URL", "CLAUDE_PLUGIN_OPTION_BASE_URL"];
 const CONFIG_API_KEY_ENV_NAMES = ["JIELI_API_KEY", "CLAUDE_PLUGIN_OPTION_API_KEY"];
@@ -1196,7 +1196,7 @@ function buildUpdatedHookInput(shell, updatedCommand) {
 
 function updatedCommitCommand(command, sessionId) {
   if (!commitTrailerEnabled()) return "";
-  if (!command || !sessionId || AMBIGUOUS_TOKENS.some((token) => command.includes(token))) return "";
+  if (!command || !sessionId) return "";
   const mapping = readJson(join(homeDir(), ".jieli", "claude-sessions.json"), {});
   const session = mapping[sessionId];
   if (!session || typeof session !== "object") return "";
@@ -1206,148 +1206,9 @@ function updatedCommitCommand(command, sessionId) {
   return injectTrailer(command, `${TRAILER_KEY}: ${baseUrl}/threads/${providerThreadId}`);
 }
 
-function injectTrailer(command, trailer) {
-  const parts = splitTopLevelAndChain(command);
-  if (!parts.length) return "";
-  const updatedParts = [];
-  let count = 0;
-  for (const part of parts) {
-    if (part === "&&") {
-      updatedParts.push(part);
-      continue;
-    }
-    const updated = appendTrailerToCommitSegment(part, trailer);
-    if (updated) {
-      count += 1;
-      if (count > 1) return "";
-      updatedParts.push(updated);
-    } else {
-      updatedParts.push(part);
-    }
-  }
-  return count === 1 ? updatedParts.join("") : "";
-}
-
-function splitTopLevelAndChain(command) {
-  const parts = [];
-  let start = 0;
-  let quote = "";
-  let escaped = false;
-  for (let i = 0; i < command.length; i += 1) {
-    const char = command[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-    if (command.startsWith("&&", i)) {
-      parts.push(command.slice(start, i), "&&");
-      i += 1;
-      start = i + 1;
-      continue;
-    }
-    if (char === "&") return [];
-  }
-  if (quote || escaped) return [];
-  parts.push(command.slice(start));
-  return parts;
-}
-
-function appendTrailerToCommitSegment(segment, trailer) {
-  const parts = shellSplit(segment);
-  if (!parts || parts.length < 2 || parts[0] !== "git" || parts[1] !== "commit") return "";
-  if (parts.some((part) => part.includes(TRAILER_KEY))) return "";
-  const pathspecIndex = findStandaloneDoubleDash(segment);
-  if (pathspecIndex >= 0) {
-    return `${segment.slice(0, pathspecIndex).trimEnd()} --trailer "${trailer}" ${segment.slice(pathspecIndex).trimStart()}`;
-  }
-  return `${segment} --trailer "${trailer}"`;
-}
-
-function findStandaloneDoubleDash(command) {
-  let quote = "";
-  let escaped = false;
-  for (let i = 0; i < command.length; i += 1) {
-    const char = command[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-    if (command.startsWith("--", i)) {
-      const before = i === 0 || /\s/.test(command[i - 1]);
-      const afterIndex = i + 2;
-      const after = afterIndex === command.length || /\s/.test(command[afterIndex]);
-      if (before && after) return i;
-      i += 1;
-    }
-  }
-  return -1;
-}
-
 function normalizeThreadId(threadId) {
   const value = String(threadId || "").trim();
   return value && !value.startsWith("T-") ? `T-${value}` : value;
-}
-
-function shellSplit(command) {
-  const parts = [];
-  let current = "";
-  let quote = "";
-  let escaped = false;
-  for (const char of command.trim()) {
-    if (escaped) {
-      current += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      else current += char;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) {
-      if (current) {
-        parts.push(current);
-        current = "";
-      }
-      continue;
-    }
-    current += char;
-  }
-  if (quote || escaped) return null;
-  if (current) parts.push(current);
-  return parts;
 }
 
 function quoteShell(value) {

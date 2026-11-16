@@ -1266,15 +1266,18 @@ test("handoff info and commit trailer helpers support Codex shell aliases and No
       'git commit -m "first"',
       'git commit -m "second"',
     ].join("\n");
-    assert.deepEqual(runtime.buildHookResponse({ session_id: "codex-chain", tool_name: "exec", tool_input: { command: multipleCommitCommand } }), {});
+    assert.equal(runtime.buildHookResponse({ session_id: "codex-chain", tool_name: "exec", tool_input: { command: multipleCommitCommand } }).hookSpecificOutput.updatedInput.command,
+      'git commit -m "first" --trailer "Jieli-Thread: https://jieli.example.test/threads/T-codex-chain"\ngit commit -m "second" --trailer "Jieli-Thread: https://jieli.example.test/threads/T-codex-chain"');
     const commitAroundHeredocCommand = [
       'git commit -m "first" && cat <<\'EOF\'',
       "message body",
       "EOF",
       'git commit -m "second"',
     ].join("\n");
-    assert.deepEqual(runtime.buildHookResponse({ session_id: "codex-chain", tool_name: "exec", tool_input: { command: commitAroundHeredocCommand } }), {});
-    assert.deepEqual(runtime.buildHookResponse({ session_id: "codex-chain", tool_name: "exec", tool_input: { command: 'git status; git commit -m "ship"' } }), {});
+    assert.equal(runtime.buildHookResponse({ session_id: "codex-chain", tool_name: "exec", tool_input: { command: commitAroundHeredocCommand } }).hookSpecificOutput.updatedInput.command,
+      'git commit -m "first" --trailer "Jieli-Thread: https://jieli.example.test/threads/T-codex-chain" && cat <<\'EOF\'\nmessage body\nEOF\ngit commit -m "second" --trailer "Jieli-Thread: https://jieli.example.test/threads/T-codex-chain"');
+    assert.equal(runtime.buildHookResponse({ session_id: "codex-chain", tool_name: "exec", tool_input: { command: 'git status; git commit -m "ship"' } }).hookSpecificOutput.updatedInput.command,
+      'git status; git commit -m "ship" --trailer "Jieli-Thread: https://jieli.example.test/threads/T-codex-chain"');
     assert.deepEqual(runtime.buildHookResponse({ session_id: "codex-chain", tool_name: "Bash", tool_input: { command: 'git commit -m "ship" | cat' } }), {});
     for (const command of [
       'git status || git commit -m "ship"',

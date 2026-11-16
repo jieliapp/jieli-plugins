@@ -7,6 +7,7 @@ import {
   readFileSync,
   renameSync,
   mkdirSync,
+  existsSync,
   realpathSync,
   symlinkSync,
 } from "node:fs";
@@ -111,6 +112,41 @@ const result = (id, output, exitCode = 0) => ({
       run: { status: "completed", result: { output, exitCode } },
     },
   ],
+});
+
+test("set -e captures four worktree commits before a read-only loop", async (t) => {
+  const f = fixture(t);
+  const directories = [];
+  for (let i = 0; i < 4; i++) {
+    const repo = join(f.temp, `project-${i}`);
+    const linked = join(f.temp, `linked-${i}`);
+    f.git("init", "-b", "main", repo);
+    f.git("-C", repo, "config", "user.name", "Test");
+    f.git("-C", repo, "config", "user.email", "test@example.test");
+    f.git("-C", repo, "remote", "add", "origin", `git@github.com:acme/project-${i}.git`);
+    f.git("-C", repo, "commit", "--allow-empty", "-m", "base");
+    f.git("-C", repo, "worktree", "add", "-b", "feature", linked);
+    writeFileSync(join(linked, "file.txt"), `project ${i}\n`);
+    f.git("-C", linked, "add", "file.txt");
+    directories.push(linked);
+  }
+  const command = ["set -e", ...directories.map((dir, i) => `git -C "${dir}" commit -m "change ${i}"`),
+    `for repo in ${directories.map(dir => `"${dir}"`).join(" ")}; do git -C "$repo" log -1 --format='%h %s'; git -C "$repo" status --short; done`].join("\n");
+  const executed = spawnSync("/bin/sh", ["-c", command], {cwd: f.temp, encoding: "utf8"});
+  assert.equal(executed.status, 0, executed.stderr);
+  const candidate = call("batch", f.temp);
+  candidate.content[0].input.cmd = command;
+  const messages = [user("request"), candidate, result("batch", executed.stdout)];
+  const shas = directories.map(dir => f.git("-C", dir, "rev-parse", "HEAD"));
+  await traceGit(f, trace => {
+    const captured = f.collect(messages);
+    assert.deepEqual(captured.commits.map(c => c.commit_sha), shas);
+    assert.deepEqual(captured.commits.map(c => c.git_remote_url), directories.map((_, i) => `git@github.com:acme/project-${i}.git`));
+    assert.ok(captured.commits.every(c => c.commit_tool_use_id === "batch" && c.start_message_id === "request" && c.end_message_id === "batch:result"));
+    trace.clear();
+    assert.deepEqual(f.collect([...messages, user("later")]), captured);
+    assert.equal(trace.calls().filter(args => args.includes("--verify") || args[0] === "patch-id").length, 0);
+  });
 });
 
 test("structured edits retain their actual worktree and nested repository ownership", (t) => {
@@ -336,7 +372,76 @@ test("captures the cherry-pick, search, and Go test command shape with real tool
   assert.equal(f.collect(messages).commits.length, 0, "failed combined checks do not confirm execution");
 });
 
+test("two same-repository commits in one success chain share a valid interval", (t) => {
+  const f = fixture(t);
+  const base = f.commit("base");
+  writeFileSync(join(f.cwd, "file.txt"), "second\n");
+  f.git("-C", f.cwd, "add", "file.txt");
+  const command = 'git commit -m second && git commit --allow-empty -m third && git rev-parse HEAD';
+  const executed = spawnSync("/bin/sh", ["-c", command], {cwd: f.cwd, encoding: "utf8"});
+  assert.equal(executed.status, 0, executed.stderr);
+  const candidate = call("batch", f.cwd);
+  candidate.content[0].input.cmd = command;
+  const captured = f.collect([user("u1"), call("base", f.cwd), result("base", base.output), user("u2"), candidate, result("batch", executed.stdout)]);
+  assert.deepEqual(captured.commits.map(c => c.commit_sha), [base.sha, f.git("-C", f.cwd, "rev-parse", "HEAD^"), f.git("-C", f.cwd, "rev-parse", "HEAD")]);
+  assert.ok(captured.commits.slice(1).every(c => c.start_message_id === "u2" && c.end_message_id === "batch:result"));
+});
+
+test("ambiguous or incomplete batch summaries cannot establish multiple commits", (t) => {
+  const f = fixture(t);
+  const first = f.commit("first"), second = f.commit("second");
+  const candidate = call("batch", f.cwd);
+  candidate.content[0].input.cmd = "set -e\ngit commit -m first\ngit commit -m second";
+  for (const output of [first.output, first.output + "\n" + second.output + "\n" + second.output,
+    first.output + "\n" + first.output,
+    first.output + `\n[main ${first.sha}] same object with a longer prefix`]) {
+    assert.equal(f.collect([user("u"), candidate, result("batch", output)]).commits.length, 0);
+  }
+});
+
+test("unsupported shell structures and quoted code do not become executed evidence", (t) => {
+  const f = fixture(t);
+  const first = f.commit("first");
+  const sentinel = join(f.temp, "must-not-be-created");
+  for (const command of [
+    "if git diff --quiet; then git commit -m hidden; fi",
+    "commit_later() { git commit -m hidden; }",
+    "cat <<'EOF'\ngit commit -m hidden\nEOF",
+    "! git commit -m hidden",
+    "git commit -m hidden &",
+    "git commit -m hidden > hidden.log",
+    `git commit -m "$(touch '${sentinel}')"`,
+    'git commit -m "unterminated',
+    "git commit -m unfinished &&",
+  ]) {
+    const candidate = call("unsupported", f.cwd);
+    candidate.content[0].input.cmd = command;
+    assert.equal(f.collect([candidate, result("unsupported", first.output)]).commits.length, 0, command);
+    assert.equal(existsSync(sentinel), false, "transcript substitutions are never executed");
+  }
+});
+
 for (const scenario of [
+  {
+    name: "a skipped set -e before a failed commit and an old summary",
+    stage: false,
+    command: () => "git rev-parse --verify missing-ref && set -e\ngit commit -m nonexistent\ngit log -1 --format='[main %h] old'",
+  },
+  {
+    name: "a loop whose later literal binding stages files",
+    stage: false,
+    command: () => 'set -e\ngit commit --allow-empty -m explicit\nfor action in status add; do git "$action" -- .; done',
+  },
+  {
+    name: "set -e masking a failed nonfinal success chain before an old summary",
+    stage: false,
+    command: () => "set -e\ngit commit -m second && git status --short\ngit log -1 --format='[main %h] old'",
+  },
+  {
+    name: "set -e skipping a producer after a failed check before an old summary",
+    stage: false,
+    command: () => "set -e\ngit rev-parse --verify missing-ref && git commit -m second\ngit log -1 --format='[main %h] old'",
+  },
   {
     name: "failed commit followed by a printed old SHA after an escaped quote",
     stage: false,
@@ -346,11 +451,6 @@ for (const scenario of [
     name: "dynamic commit arguments followed by reading HEAD",
     stage: true,
     command: () => 'git commit -m "$(git rev-parse --short HEAD)" && git rev-parse HEAD',
-  },
-  {
-    name: "two successful commits followed by reading HEAD",
-    stage: true,
-    command: () => 'git commit -m second && git commit --allow-empty -m third && git rev-parse HEAD',
   },
   {
     name: "a commit piped into an output filter",
@@ -452,6 +552,22 @@ test("amend inherits observed replaced commit range but failed and echo commands
       "an amend only needs one reflog read",
     );
   });
+});
+
+test("an amend followed by another commit in the same tool retains its replaced range", (t) => {
+  const f = fixture(t);
+  const first = f.commit("first");
+  const command = "git commit --amend --allow-empty -m amended && git commit --allow-empty -m after";
+  const executed = spawnSync('/bin/sh', ['-c', command], {cwd:f.cwd, encoding:'utf8'});
+  assert.equal(executed.status, 0, executed.stderr);
+  const candidate = call("batch", f.cwd);
+  candidate.content[0].input.cmd = command;
+  const captured = f.collect([user("u1"), call("first", f.cwd), result("first", first.output), user("u2"), candidate, result("batch", executed.stdout)]);
+  assert.equal(captured.commits.length, 3);
+  assert.equal(captured.commits[1].superseded_sha, first.sha);
+  assert.equal(captured.commits[1].start_message_id, "u1");
+  assert.equal(captured.commits[2].start_message_id, "u1");
+  assert.equal(captured.commits[2].superseded_sha, "");
 });
 
 for (const shared of [false, true])

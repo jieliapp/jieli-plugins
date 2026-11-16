@@ -12,9 +12,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - run: npm ci
       - run: node --test plugins/claude-code/tests/runtime-node.test.mjs
       - run: node --test plugins/codex/tests/*.test.mjs
-      - run: npm ci
       - run: npm run test:history
 
   codex-titles:

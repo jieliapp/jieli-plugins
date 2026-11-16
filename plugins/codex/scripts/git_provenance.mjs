@@ -1,4 +1,5 @@
 // Source for the standalone plugin copies; scripts/build-history.mjs distributes it.
+import { commitCommands } from "./shell_commands.mjs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -39,57 +40,6 @@ export function remoteWithoutCredentials(raw) {
   u.search = "";
   u.hash = "";
   return u.toString();
-}
-function commandRepo(input, cwd) {
-  const command = input.cmd ?? input.command;
-  if (typeof command !== "string") return null;
-  // A bounded literal sequence, not a shell parser. Quoted newlines remain arguments.
-  if (/[`$\\]/.test(command)) return null;
-  const parts = [{tokens: [], piped: false, separator: ""}];
-  for (const token of command.match(/"[^"]*"|'[^']*'|&&|\|\||\n|2>&1|>>?|[^\s;&|<>]+|[;&|<>]/g) ?? []) {
-    if (token === "&&" || token === "\n" || token === "|") {
-      if (token === "|") parts.at(-1).piped = true;
-      if (parts.at(-1).tokens.length) parts.push({tokens: [], piped: token === "|", separator: token});
-    } else {
-      if (/^[;&<]$|^\|\|$/.test(token) || (/["']/.test(token) && !/^"[^"]*"$|^'[^']*'$/.test(token))) return null;
-      parts.at(-1).tokens.push(/^["']/.test(token) ? token.slice(1, -1) : token);
-    }
-  }
-  let producing = null;
-  for (const {tokens, piped, separator} of parts.filter((part) => part.tokens.length)) {
-    // Later output is evidence only when these checks depend on the producer succeeding.
-    if (producing && separator !== "&&" && separator !== "|") return null;
-    if (tokens[0] !== "git") {
-      if (producing && (["rg", "head"].includes(tokens[0]) || (tokens[0] === "go" && tokens[1] === "test"))) continue;
-      return null;
-    }
-    let dir = input.workdir || input.cwd || cwd;
-    let i = 1;
-    while (tokens[i] === "-C" || tokens[i] === "-c") {
-      if (!tokens[i + 1]) return null;
-      if (tokens[i] === "-C") dir = resolve(dir, tokens[i + 1]);
-      i += 2;
-    }
-    const action = tokens[i];
-    const args = tokens.slice(i + 1);
-    if (action === "commit" || action === "cherry-pick") {
-      if (producing || piped || args.some((arg) => [">", ">>", "2>&1"].includes(arg))) return null;
-      // Recognize normal producing modes explicitly; quiet/status/help variants have no usable summary.
-      for (let j = 0; j < args.length; j++) {
-        const arg = args[j];
-        if (action === "commit" && ["-m", "--message", "-F", "--file", "-am"].includes(arg)) {
-          if (!args[++j]) return null;
-          continue;
-        }
-        if (action === "commit" && (/^(?:-m.|-F.|--message=.|--file=.)/.test(arg) ||
-          ["--amend", "--no-edit", "--allow-empty", "--allow-empty-message", "-a", "--all", "-s", "--signoff", "-v", "--verbose", "--no-verify"].includes(arg))) continue;
-        if (action === "cherry-pick" && ["--continue", "-x"].includes(arg)) continue;
-        if (arg.startsWith("-")) return null;
-      }
-      producing = {dir, amend: action === "commit" && args.includes("--amend")};
-    } else if (!["diff", "status", "rev-parse"].includes(action) && !(action === "add" && !producing)) return null;
-  }
-  return producing;
 }
 function blocks(message) {
   return Array.isArray(message.content) ? message.content : [];
@@ -302,8 +252,8 @@ export function collectGitEvidence({
         !["Bash", "shell_command", "exec_command"].includes(name(tool))
       )
         continue;
-      const call = commandRepo(tool.input ?? {}, cwd);
-      if (!call) continue;
+      const commands = commitCommands(tool.input ?? {}, cwd);
+      if (!commands?.length) continue;
       const terminal = completions.get(tool.id);
       if (!terminal || !completed(terminal.block)) continue;
       const fingerprint = createHash("sha256")
@@ -311,110 +261,112 @@ export function collectGitEvidence({
           JSON.stringify([tool.input, terminal.output, terminal.block.run]),
         )
         .digest("hex");
-      const captured = cache.commits[tool.id];
-      let record;
-      if (captured?.fingerprint === fingerprint && captured.record)
-        record = captured.record;
-      else {
-        const headers = [
-          ...terminal.output.matchAll(
-            /^\[[^\]\r\n]+\s(?:\(root-commit\)\s)?([a-f0-9]{7,40})\]\s[^\r\n]+/gm,
-          ),
-        ];
-        if (headers.length !== 1) continue;
-        const state = failureState(call.dir);
-        if (
-          captured?.fingerprint === fingerprint &&
-          captured.failedState === state
-        ) {
-          complete = false;
-          continue;
+      const headers = [...terminal.output.matchAll(
+        /^\[[^\]\r\n]+\s(?:\(root-commit\)\s)?([a-f0-9]{7,40})\]\s[^\r\n]+/gm,
+      )];
+      const prefixes = headers.map(h => h[1]).sort();
+      if (headers.length !== commands.length || prefixes.some((prefix, i) => i > 0 && prefix.startsWith(prefixes[i - 1]))) continue;
+      for (const [index, call] of commands.entries()) {
+        // Keep the original key for single-command evidence already cached.
+        const cacheKey = index === 0 ? tool.id : `${tool.id}:${index}`;
+        const captured = cache.commits[cacheKey];
+        let record;
+        if (captured?.fingerprint === fingerprint && captured.record)
+          record = captured.record;
+        else {
+          const state = failureState(call.dir);
+          if (
+            captured?.fingerprint === fingerprint &&
+            captured.failedState === state
+          ) {
+            complete = false;
+            continue;
+          }
+          // A failed lookup must not revoke previously captured server evidence.
+          cache.commits[cacheKey] = { fingerprint, failedState: state };
+          const sha = git(call.dir, [
+            "rev-parse",
+            "--verify",
+            `${headers[index][1]}^{commit}`,
+          ]);
+          if (!sha || !/^[a-f0-9]{40}$/.test(sha)) {
+            complete = false;
+            continue;
+          }
+          const info = git(call.dir, ["show", "-s", "--format=%P%n%ct%n%s", sha]);
+          const files = git(call.dir, [
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            sha,
+          ]);
+          const rawRemote = git(call.dir, [
+            "config",
+            "--get",
+            "remote.origin.url",
+          ]);
+          if (info === null || files === null || rawRemote === null) {
+            complete = false;
+            continue;
+          }
+          const [parents, seconds, ...subject] = info.split("\n");
+          const diff =
+            parents.split(" ").filter(Boolean).length > 1
+              ? ""
+              : git(call.dir, [
+                  "show",
+                  "--format=",
+                  "--no-ext-diff",
+                  "--no-textconv",
+                  sha,
+                ]);
+          const patch = diff
+            ? git(call.dir, ["patch-id", "--stable"], diff + "\n")
+            : "";
+          if (diff === null || patch === null) {
+            complete = false;
+            continue;
+          }
+          record = {
+            commit_sha: sha,
+            patch_id: patch.split(/\s+/)[0],
+            subject: subject.join("\n"),
+            files: files ? files.split("\n").slice(0, 500) : [],
+            files_truncated: files.split("\n").length > 500,
+            git_remote_url: remoteWithoutCredentials(rawRemote),
+            commit_tool_use_id: tool.id,
+            committed_at_ms: Number(seconds) * 1000,
+          };
+          // Later producers in this tool can move HEAD past an amend before capture.
+          const reflog = call.amend
+            ? git(call.dir, ["reflog", "show", `-${commands.length - index + 1}`, "--format=%H%x09%gs"])?.split("\n")
+            : [];
+          const amendedIndex = reflog?.findIndex(entry => entry.startsWith(sha + "\tcommit (amend):")) ?? -1;
+          const amendedFrom = amendedIndex >= 0 ? reflog[amendedIndex + 1]?.split("\t")[0] : "";
+          cache.commits[cacheKey] = { fingerprint, record, amendedFrom };
         }
-        // A failed lookup must not revoke previously captured server evidence.
-        cache.commits[tool.id] = { fingerprint, failedState: state };
-        const sha = git(call.dir, [
-          "rev-parse",
-          "--verify",
-          `${headers[0][1]}^{commit}`,
-        ]);
-        if (!sha || !/^[a-f0-9]{40}$/.test(sha)) {
-          complete = false;
-          continue;
-        }
-        const info = git(call.dir, ["show", "-s", "--format=%P%n%ct%n%s", sha]);
-        const files = git(call.dir, [
-          "diff-tree",
-          "--root",
-          "--no-commit-id",
-          "--name-only",
-          "-r",
-          sha,
-        ]);
-        const rawRemote = git(call.dir, [
-          "config",
-          "--get",
-          "remote.origin.url",
-        ]);
-        if (info === null || files === null || rawRemote === null) {
-          complete = false;
-          continue;
-        }
-        const [parents, seconds, ...subject] = info.split("\n");
-        const diff =
-          parents.split(" ").filter(Boolean).length > 1
-            ? ""
-            : git(call.dir, [
-                "show",
-                "--format=",
-                "--no-ext-diff",
-                "--no-textconv",
-                sha,
-              ]);
-        const patch = diff
-          ? git(call.dir, ["patch-id", "--stable"], diff + "\n")
-          : "";
-        if (diff === null || patch === null) {
-          complete = false;
-          continue;
-        }
+        // Ranges depend on the current sequence, so only object validation is cached.
+        const prior = previousByRemote.get(record.git_remote_url);
+        const inherited =
+          call.amend &&
+          prior &&
+          cache.commits[cacheKey]?.amendedFrom === prior.commit_sha;
+        const sameTool = prior?.end_message_id === terminal.message.message_id;
+        const first = prior ? positions.get(prior.end_message_id) + 1 : 0;
         record = {
-          commit_sha: sha,
-          patch_id: patch.split(/\s+/)[0],
-          subject: subject.join("\n"),
-          files: files ? files.split("\n").slice(0, 500) : [],
-          files_truncated: files.split("\n").length > 500,
-          git_remote_url: remoteWithoutCredentials(rawRemote),
-          commit_tool_use_id: tool.id,
-          committed_at_ms: Number(seconds) * 1000,
+          ...record,
+          commit_message_id: m.message_id,
+          end_message_id: terminal.message.message_id,
+          start_message_id: inherited || sameTool
+            ? prior.start_message_id
+            : messages[first]?.message_id,
+          superseded_sha: inherited ? prior.commit_sha : "",
         };
-        const reflog = call.amend
-          ? git(call.dir, ["reflog", "show", "-2", "--format=%H%x09%gs"])
-          : null;
-        const amendedFrom = reflog
-          ?.split("\n")[0]
-          ?.startsWith(sha + "\tcommit (amend):")
-          ? reflog.split("\n")[1]?.split("\t")[0]
-          : "";
-        cache.commits[tool.id] = { fingerprint, record, amendedFrom };
+        evidence.push(record);
+        previousByRemote.set(record.git_remote_url, record);
       }
-      // Ranges depend on the current sequence, so only object validation is cached.
-      const prior = previousByRemote.get(record.git_remote_url);
-      const inherited =
-        call.amend &&
-        prior &&
-        cache.commits[tool.id]?.amendedFrom === prior.commit_sha;
-      const first = prior ? positions.get(prior.end_message_id) + 1 : 0;
-      record = {
-        ...record,
-        commit_message_id: m.message_id,
-        end_message_id: terminal.message.message_id,
-        start_message_id: inherited
-          ? prior.start_message_id
-          : messages[first]?.message_id,
-        superseded_sha: inherited ? prior.commit_sha : "",
-      };
-      evidence.push(record);
-      previousByRemote.set(record.git_remote_url, record);
     }
   const encoded = JSON.stringify(cache);
   if (!existsSync(file) || readFileSync(file, "utf8") !== encoded) {
