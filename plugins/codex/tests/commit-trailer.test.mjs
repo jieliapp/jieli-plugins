@@ -9,6 +9,51 @@ import * as claude from "../../claude-code/scripts/jieli_node.mjs";
 import { withEnv } from "../../test_helpers/runtime.mjs";
 
 for (const [provider, runtime] of [["codex", codex], ["claude", claude]]) {
+  for (const input of ['stdin', 'python']) {
+    test(`${provider}: ${input} message survives hook, Git and provenance upload payload`, async (t) => {
+      const temp = mkdtempSync(join(tmpdir(), 'jieli-input-roundtrip-'));
+      t.after(() => rmSync(temp, { recursive: true, force: true }));
+      const git = (...args) => {
+        const r = spawnSync('git', args, { cwd: temp, encoding: 'utf8' });
+        assert.equal(r.status, 0, r.stderr);
+        return r.stdout.trim();
+      };
+      git('init', '-b', 'main');
+      git('config', 'user.name', 'Test');
+      git('config', 'user.email', 'test@example.test');
+      git('remote', 'add', 'origin', 'git@github.com:acme/input.git');
+      const command = input === 'stdin'
+        ? "set -e\ngit commit --allow-empty -F - <<'MSG'\nfeat: input\n\ngit commit -m only-data\nMSG\ngit status --short"
+        : "python3 - <<'PY'\nfrom pathlib import Path\nPath('message.txt').write_text('feat: input\\n\\ngit commit -m only-data\\n')\nPY\ngit commit --allow-empty -F message.txt";
+      mkdirSync(join(temp, '.jieli'));
+      writeFileSync(join(temp, '.jieli', provider === 'codex' ? 'codex-sessions.json' : 'claude-sessions.json'), JSON.stringify({ input: { provider_thread_id: 'T-input', base_url: 'https://jieli.example.test' } }));
+      await withEnv({ HOME: temp }, async () => {
+        const hook = command => runtime.buildHookResponse({ session_id: 'input', tool_name: 'Bash', tool_input: { command } });
+        const rewritten = hook(command).hookSpecificOutput?.updatedInput.command;
+        assert.ok(rewritten);
+        assert.deepEqual(hook(rewritten), {}, 'hook is idempotent');
+        const executed = spawnSync('/bin/sh', ['-c', rewritten], { cwd: temp, encoding: 'utf8' });
+        assert.equal(executed.status, 0, executed.stderr);
+        assert.equal(git('show', '-s', '--format=%(trailers:key=Jieli-Thread,valueonly)'), 'https://jieli.example.test/threads/T-input');
+        assert.match(git('show', '-s', '--format=%B'), /git commit -m only-data/);
+        const transcript = join(temp, 'session.jsonl');
+        const entries = provider === 'codex' ? [
+          { type: 'session_meta', payload: { id: 'input', cwd: temp } },
+          { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'input-call', arguments: JSON.stringify({ cmd: rewritten, workdir: temp }) } },
+          { type: 'response_item', payload: { type: 'function_call_output', call_id: 'input-call', output: `Process exited with code 0\nOutput:\n${executed.stdout}` } },
+        ] : [
+          { type: 'assistant', uuid: 'input-call', sessionId: 'input', cwd: temp, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'input-call', name: 'Bash', input: { command: rewritten } }] } },
+          { type: 'user', uuid: 'input-result', sessionId: 'input', cwd: temp, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'input-call', content: executed.stdout }] } },
+        ];
+        writeFileSync(transcript, entries.map(JSON.stringify).join('\n'));
+        const payload = await runtime.buildPayloadFromHook({ transcript_path: transcript, session_id: 'input', cwd: temp }, 'https://jieli.example.test', null,
+          ...(provider === 'codex' ? [null, { includeSummaryStats: false }] : [{ includeSummaryStats: false }]));
+        assert.deepEqual(payload.commits.map(c => c.commit_sha), [git('rev-parse', 'HEAD')]);
+        assert.equal(payload.commits[0].commit_tool_use_id, 'input-call');
+      });
+    });
+  }
+
   test(`${provider}: hook trailers cover every literal cross-repo batch commit`, async (t) => {
     const temp = mkdtempSync(join(tmpdir(), "jieli-trailers-"));
     t.after(() => rmSync(temp, { recursive: true, force: true }));

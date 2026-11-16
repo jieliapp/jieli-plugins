@@ -31,7 +31,7 @@ function script(source) {
 // Keep option boundaries identical for collection and trailer insertion: a
 // message/file/trailer value named "--" is not the pathspec separator.
 function commitOptions(args) {
-  let amend = false, hasTrailer = false, pathspec = -1;
+  let amend = false, hasTrailer = false, pathspec = -1, stdin = false;
   const jieliTrailer = /(?:^|\r?\n)[\t ]*Jieli-Thread[\t ]*[:=]/i;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -39,6 +39,7 @@ function commitOptions(args) {
     if (["-m", "--message", "-F", "--file", "-am", "--trailer"].includes(arg)) {
       if (args[i + 1] === undefined) return null;
       const value = args[++i];
+      if (["-F", "--file"].includes(arg)) stdin = value === "-";
       if (["-m", "--message", "-am", "--trailer"].includes(arg) && jieliTrailer.test(value)) hasTrailer = true;
       continue;
     }
@@ -51,14 +52,15 @@ function commitOptions(args) {
       if (jieliTrailer.test(message[1])) hasTrailer = true;
       continue;
     }
-    if (/^(?:-m.|-F.|--message=.|--file=.)/.test(arg)) continue;
+    const file = /^(?:-F|--file=)([\s\S]+)$/.exec(arg);
+    if (file) { stdin = file[1] === "-"; continue; }
     if (["--amend", "--no-edit", "--allow-empty", "--allow-empty-message", "-a", "--all", "-s", "--signoff", "-v", "--verbose", "--no-verify"].includes(arg)) {
       if (arg === "--amend") amend = true;
       continue;
     }
     if (arg.startsWith("-")) return null;
   }
-  return { amend, hasTrailer, pathspec };
+  return { amend, hasTrailer, pathspec, stdin };
 }
 
 // Edit source spans, not printed AST text, so comments/quoting/heredocs stay exact.
@@ -112,6 +114,7 @@ export function commitCommands(input, cwd) {
   const commands = [];
   let errexit = false;
   let loopSeen = false;
+  let preparationSeen = false, endsInProducer = false;
   const visit = (node, { piped = false, readOnly = false, variables = {}, topLevel = false } = {}) => {
     if (node.type === "Statement") {
       if (node.background) return false; // Background statements are not completion evidence.
@@ -134,10 +137,15 @@ export function commitCommands(input, cwd) {
       return values.every(value => node.body.commands.every(child => visit(child, { readOnly: true, variables: { [key]: value } })));
     }
     if (node.type !== "Command" || node.prefix.length) return false;
+    endsInProducer = false;
     const executable = literal(node.name);
     const words = node.suffix.filter(part => part.type === "Word");
     const redirects = node.suffix.filter(part => part.type !== "Word");
-    if (redirects.some(part => part.type !== "Redirect" || ![">", ">>", ">&"].includes(part.operator) || literal(part.target, variables) === null)) return false;
+    const literalStdin = redirects.length === 1 && redirects[0].type === "HereDoc" &&
+      ["<<", "<<-"].includes(redirects[0].operator) && redirects[0].delimiter?.quoted &&
+      Boolean(redirects[0].closing) && (!redirects[0].descriptor ||
+        (redirects[0].descriptor.type === "FileDescriptor" && redirects[0].descriptor.value === 0));
+    if (!literalStdin && redirects.some(part => part.type !== "Redirect" || ![">", ">>", ">&"].includes(part.operator) || literal(part.target, variables) === null)) return false;
     const args = words.map(word => literal(word, variables));
     if (args.some(value => value === null)) return false;
     if (executable === "set") {
@@ -146,7 +154,12 @@ export function commitCommands(input, cwd) {
       return true;
     }
     if (executable !== "git") {
-      return !readOnly && commands.length > 0 &&
+      if (["python", "python3"].includes(executable)) {
+        if (!topLevel || readOnly || piped || commands.length || args.length !== 1 || args[0] !== "-" || !literalStdin) return false;
+        preparationSeen = true;
+        return true;
+      }
+      return !literalStdin && !readOnly && commands.length > 0 &&
         (["rg", "head"].includes(executable) || (executable === "go" && args[0] === "test"));
     }
     let dir = input.workdir || input.cwd || cwd;
@@ -159,13 +172,15 @@ export function commitCommands(input, cwd) {
     const action = args[i++];
     const options = args.slice(i);
     if (action !== "commit" && action !== "cherry-pick") {
-      return ["diff", "status", "rev-parse", "log"].includes(action) || (!readOnly && action === "add");
+      return !literalStdin && (["diff", "status", "rev-parse", "log"].includes(action) || (!readOnly && action === "add"));
     }
-    if (readOnly || piped || redirects.length || loopSeen) return false;
+    if (readOnly || piped || loopSeen) return false;
     const mode = action === "commit" ? commitOptions(options) : { amend: false };
     if (!mode) return false;
+    if (redirects.length && !(literalStdin && mode.stdin)) return false;
     if (action === "cherry-pick" && options.some(option => option.startsWith("-") && !["--continue", "-x"].includes(option))) return false;
     commands.push({ dir, amend: mode.amend });
+    endsInProducer = true;
     return true;
   };
   for (const [index, statement] of ast.commands.entries()) {
@@ -177,5 +192,7 @@ export function commitCommands(input, cwd) {
     // Only the final list has its success established by the tool exit status.
     if (commands.length > before && statement.command.type === "AndOr" && index !== ast.commands.length - 1) return null;
   }
-  return commands;
+  // Python is opaque preparation. Require the final shell status to belong to
+  // a producer (or its && chain), never a following status/inspection command.
+  return preparationSeen && !endsInProducer ? null : commands;
 }

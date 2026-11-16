@@ -697,3 +697,88 @@ for (const restore of ["loose", "pack"])
       assert.equal(recovered.commits[0].commit_sha, candidate.sha);
     });
   });
+
+for (const fileOption of ['-F -', '--file -', '-F-', '--file=-']) {
+  test(`collects a literal stdin heredoc commit using ${fileOption}`, (t) => {
+    const f = fixture(t);
+    f.commit('base');
+    const command = `set -e\ngit commit --allow-empty ${fileOption} <<-'MESSAGE'\n\tfeat: literal input\n\n\tgit commit -m not-executed\n\t$(touch must-not-exist)\nMESSAGE\ngit status --short`;
+    const executed = spawnSync('/bin/sh', ['-c', command], {cwd:f.cwd, encoding:'utf8'});
+    assert.equal(executed.status, 0, executed.stderr);
+    const candidate = call('stdin', f.cwd);
+    candidate.content[0].input.cmd = command;
+    const captured = f.collect([user('u'), candidate, result('stdin', executed.stdout)]);
+    assert.equal(captured.commits.length, 1);
+    assert.equal(captured.commits[0].commit_sha, f.git('-C', f.cwd, 'rev-parse', 'HEAD'));
+    assert.equal(existsSync(join(f.cwd, 'must-not-exist')), false);
+  });
+}
+
+for (const finalCommand of [
+  'git commit --allow-empty -F message.txt',
+  'git diff --check && git commit --allow-empty -F message.txt && git commit --allow-empty -m second',
+]) test(`collects Python preparation followed by ${finalCommand}`, (t) => {
+  const f = fixture(t);
+  f.commit('base');
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\nPath('message.txt').write_text('feat: prepared message\\n\\ngit commit -m only-data\\n')\nPY\n${finalCommand}`;
+  const executed = spawnSync('/bin/sh', ['-c', command], { cwd: f.cwd, encoding: 'utf8' });
+  assert.equal(executed.status, 0, executed.stderr);
+  const candidate = call('python', f.cwd);
+  candidate.content[0].input.cmd = command;
+  const captured = f.collect([user('u'), candidate, result('python', executed.stdout)]);
+  const expected = finalCommand.includes('-m second')
+    ? [f.git('-C', f.cwd, 'rev-parse', 'HEAD^'), f.git('-C', f.cwd, 'rev-parse', 'HEAD')]
+    : [f.git('-C', f.cwd, 'rev-parse', 'HEAD')];
+  assert.deepEqual(captured.commits.map(c => c.commit_sha), expected);
+  assert.ok(captured.commits.every(c => c.commit_tool_use_id === 'python' && c.start_message_id === 'u'));
+});
+
+test('rejects unsupported stdin and preparation boundaries even with a real commit summary', (t) => {
+  const f = fixture(t);
+  const base = f.commit('base');
+  const prep = "python3 - <<'PY'\npass\nPY\n";
+  for (const command of [
+    'git commit -F - <<EOF\nmessage\nEOF',
+    "git commit -F - 3<<'EOF'\nmessage\nEOF",
+    "git commit -F - {fd}<<'EOF'\nmessage\nEOF",
+    "git commit -F - <<'A' <<'B'\none\nA\ntwo\nB",
+    "git commit -F - <<'EOF' >output\nmessage\nEOF",
+    "git commit -F - <<'EOF' 2>&1\nmessage\nEOF",
+    "git commit -m '-F-' <<'EOF'\nmessage\nEOF",
+    "git commit --file=- --file=message.txt <<'EOF'\nmessage\nEOF",
+    "git commit -F - <<'EOF'\nunterminated",
+    'python3 - <<PY\npass\nPY\ngit commit -m change',
+    "python3 - {fd}<<'PY'\npass\nPY\ngit commit -m change",
+    "python3 -c 'pass'\ngit commit -m change",
+    "python3 - <<'PY' && git commit -m change\npass\nPY",
+    `set -e\ngit commit -m change\n${prep}`,
+    `set -e\n${prep}git commit -m change\ngit status --short`,
+    `${prep}git commit -m change && git status --short`,
+    `${prep}git commit -m change | head`,
+    `${prep}git commit -m change &`,
+    `${prep}git commit -m "$SUBJECT"`,
+  ]) {
+    const candidate = call('boundary', f.cwd);
+    candidate.content[0].input.cmd = command;
+    assert.equal(f.collect([user('u'), candidate, result('boundary', base.output)]).commits.length, 0, command);
+  }
+});
+
+test('Python preparation cannot mask failed or skipped commits or add ambiguous summaries', (t) => {
+  const f = fixture(t);
+  const base = f.commit('base');
+  writeFileSync(join(f.cwd, 'old.log'), base.output + '\n');
+  const prep = "python3 - <<'PY'\nfrom pathlib import Path\nprint(Path('old.log').read_text(), end='')\nPY\n";
+  for (const [command, exitCode] of [
+    [prep + 'git commit -m no-changes', 1],
+    [prep + 'git commit -m no-changes\ngit status --short', 0],
+    ['set -e\n' + prep + 'git rev-parse --verify missing-ref && git commit -m skipped\ngit status --short', 0],
+    [prep + 'git commit --allow-empty -m actual', 0],
+  ]) {
+    const executed = spawnSync('/bin/sh', ['-c', command], { cwd: f.cwd, encoding: 'utf8' });
+    assert.equal(executed.status, exitCode, executed.stderr);
+    const candidate = call('ambiguous-python', f.cwd);
+    candidate.content[0].input.cmd = command;
+    assert.equal(f.collect([user('u'), candidate, result('ambiguous-python', executed.stdout, executed.status)]).commits.length, 0, command);
+  }
+});
