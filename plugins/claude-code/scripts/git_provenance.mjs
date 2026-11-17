@@ -1,5 +1,5 @@
 // Source for the standalone plugin copies; scripts/build-history.mjs distributes it.
-import { commitCommands } from "./shell_commands.mjs";
+import { commitCommands, shellActivity } from "./shell_commands.mjs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -195,27 +195,62 @@ export function collectGitEvidence({
       const call = calls.get(b.tool_use_id);
       if (!call) continue;
       const output = b.run?.result?.output ?? "";
+      const priorSession = name(call.block) === "write_stdin"
+        ? sessions.get(String(call.block.input?.process_id ?? call.block.input?.session_id)) : null;
       const running = /Process running with session ID\s+(\d+)/.exec(output);
       if (running) {
         sessions.set(running[1], {
           original:
-            sessions.get(String(call.block.input?.process_id))?.original ??
+            priorSession?.original ??
             b.tool_use_id,
-          output: (sessions.get(running[1])?.output ?? "") + output,
+          output: (priorSession?.output ?? "") + output,
         });
         continue;
       }
       const prior =
         name(call.block) === "write_stdin"
-          ? sessions.get(String(call.block.input?.process_id))
+          ? priorSession
           : null;
+      if (prior) sessions.delete(String(call.block.input?.process_id ?? call.block.input?.session_id));
       completions.set(prior?.original ?? b.tool_use_id, {
         block: b,
         message: m,
         output: (prior?.output ?? "") + output,
       });
     }
+  const diagnostics = [];
+  let complete = true;
+  const diagnose = (tool, code) => {
+    complete = false;
+    if (diagnostics.some(d => d.tool_use_id === tool?.id && d.code === code)) return;
+    const diagnostic = { tool_use_id: tool?.id ?? "", code };
+    if (diagnostics.length < 100) diagnostics.push(diagnostic);
+    else if (diagnostics.at(-1).code !== "diagnostics_truncated") diagnostics[99] = { ...diagnostic, code: "diagnostics_truncated" };
+  };
   const repositoryFor = editRepositories();
+  const positions = new Map(messages.map((m, i) => [m.message_id, i]));
+  const repositoryActivity = new Map();
+  const addRepository = (context, tool, message) => {
+    if (!context) return;
+    const entry = { ...context };
+    if (tool) entry.tool_use_id = tool.id;
+    if (message) {
+      entry.message_id = message.message_id;
+      if (Number.isFinite(message.timestamp_ms)) entry.event_ms = message.timestamp_ms;
+    }
+    let activity = repositoryActivity.get(entry.git_root);
+    if (!activity) {
+      activity = {};
+      repositoryActivity.set(entry.git_root, activity);
+    }
+    if (!tool) activity.initial = entry;
+    else {
+      const position = positions.get(message.message_id);
+      if (!activity.first || position < positions.get(activity.first.message_id)) activity.first = entry;
+      if (!activity.last || position >= positions.get(activity.last.message_id)) activity.last = entry;
+    }
+  };
+  if (cache.git_root) addRepository({ git_root: cache.git_root, git_remote_url: cache.git_remote_url });
   for (const { block: tool } of calls.values()) {
     const input = tool.input ?? {};
     let paths;
@@ -234,17 +269,18 @@ export function collectGitEvidence({
     const contexts = new Map();
     for (const path of paths) {
       if (typeof path !== "string" || !path) continue;
-      const directory = dirname(resolve(input.workdir || input.cwd || cwd, path));
+      const directory = dirname(resolve(cwd, input.workdir || input.cwd || ".", path));
       const context = repositoryFor(directory);
       if (context) contexts.set(context.git_root, context);
     }
     tool.git_repositories = [...contexts.values()];
+    for (const context of contexts.values()) addRepository(context, tool, calls.get(tool.id).message);
   }
   const failureState = failureStates();
   const previousByRemote = new Map();
-  const positions = new Map(messages.map((m, i) => [m.message_id, i]));
   const evidence = [];
-  let complete = true;
+  const references = [];
+
   for (const m of messages)
     for (const tool of blocks(m)) {
       if (
@@ -252,10 +288,28 @@ export function collectGitEvidence({
         !["Bash", "shell_command", "exec_command"].includes(name(tool))
       )
         continue;
-      const commands = commitCommands(tool.input ?? {}, cwd);
-      if (!commands?.length) continue;
+      let commands = commitCommands(tool.input ?? {}, cwd);
+      const activity = shellActivity(tool.input ?? {}, cwd);
       const terminal = completions.get(tool.id);
-      if (!terminal || !completed(terminal.block)) continue;
+      if (!terminal || !completed(terminal.block)) {
+        if (activity.producer) diagnose(tool, !terminal || terminal.block.run?.status !== "completed" ? "producer_not_completed" : "producer_not_successful");
+        continue;
+      }
+      for (const dir of activity.dirs) addRepository(repositoryFor(dir), tool, m);
+      let reference = false;
+      if (!commands?.length) {
+        if (!activity.producer) continue;
+        diagnose(tool, "unsupported_producer");
+        const targets = new Map();
+        for (const dir of activity.targetDirs) {
+          const context = repositoryFor(dir);
+          if (!context) { targets.set(dir, null); continue; }
+          targets.set(context.git_root, context);
+        }
+        if (!activity.referenceEligible || targets.size !== 1 || ![...targets.values()][0]?.git_remote_url) continue;
+        reference = true;
+        commands = [{ dir: [...targets.values()][0].git_root, amend: false }];
+      }
       const fingerprint = createHash("sha256")
         .update(
           JSON.stringify([tool.input, terminal.output, terminal.block.run]),
@@ -265,10 +319,18 @@ export function collectGitEvidence({
         /^\[[^\]\r\n]+\s(?:\(root-commit\)\s)?([a-f0-9]{7,40})\]\s[^\r\n]+/gm,
       )];
       const prefixes = headers.map(h => h[1]).sort();
-      if (headers.length !== commands.length || prefixes.some((prefix, i) => i > 0 && prefix.startsWith(prefixes[i - 1]))) continue;
+      if (!headers.length || (!reference && headers.length !== commands.length) || prefixes.some((prefix, i) => i > 0 && prefix.startsWith(prefixes[i - 1]))) {
+        diagnose(tool, "ambiguous_commit_summary");
+        continue;
+      }
+      if (reference) commands = headers.map(() => commands[0]);
       for (const [index, call] of commands.entries()) {
+        if (reference && references.length >= 500) {
+          diagnose(tool, "commit_references_truncated");
+          break;
+        }
         // Keep the original key for single-command evidence already cached.
-        const cacheKey = index === 0 ? tool.id : `${tool.id}:${index}`;
+        const cacheKey = (reference ? "reference:" : "") + (index === 0 ? tool.id : `${tool.id}:${index}`);
         const captured = cache.commits[cacheKey];
         let record;
         if (captured?.fingerprint === fingerprint && captured.record)
@@ -279,7 +341,7 @@ export function collectGitEvidence({
             captured?.fingerprint === fingerprint &&
             captured.failedState === state
           ) {
-            complete = false;
+            diagnose(tool, "object_lookup_failed");
             continue;
           }
           // A failed lookup must not revoke previously captured server evidence.
@@ -290,7 +352,7 @@ export function collectGitEvidence({
             `${headers[index][1]}^{commit}`,
           ]);
           if (!sha || !/^[a-f0-9]{40}$/.test(sha)) {
-            complete = false;
+            diagnose(tool, "object_lookup_failed");
             continue;
           }
           const info = git(call.dir, ["show", "-s", "--format=%P%n%ct%n%s", sha]);
@@ -308,10 +370,14 @@ export function collectGitEvidence({
             "remote.origin.url",
           ]);
           if (info === null || files === null || rawRemote === null) {
-            complete = false;
+            diagnose(tool, "object_lookup_failed");
             continue;
           }
           const [parents, seconds, ...subject] = info.split("\n");
+          if (reference && headers[index][0].slice(headers[index][0].indexOf("] ") + 2) !== subject.join("\n")) {
+            diagnose(tool, "summary_subject_mismatch");
+            continue;
+          }
           const diff =
             parents.split(" ").filter(Boolean).length > 1
               ? ""
@@ -326,7 +392,7 @@ export function collectGitEvidence({
             ? git(call.dir, ["patch-id", "--stable"], diff + "\n")
             : "";
           if (diff === null || patch === null) {
-            complete = false;
+            diagnose(tool, "object_lookup_failed");
             continue;
           }
           record = {
@@ -364,10 +430,31 @@ export function collectGitEvidence({
             : messages[first]?.message_id,
           superseded_sha: inherited ? prior.commit_sha : "",
         };
-        evidence.push(record);
-        previousByRemote.set(record.git_remote_url, record);
+        (reference ? references : evidence).push(record);
+        addRepository(repositoryFor(call.dir), tool, m);
+        if (!reference) previousByRemote.set(record.git_remote_url, record);
       }
     }
+  // Prioritize initial workspace + every distinct repository before spending
+  // remaining slots on first/last anchors from repeated operations.
+  const repositories = [];
+  const repositoryKeys = new Set();
+  const emitRepository = entry => {
+    if (!entry) return;
+    const key = JSON.stringify([entry.git_root, entry.tool_use_id]);
+    if (repositoryKeys.has(key)) return;
+    if (repositories.length >= 256) {
+      diagnose({ id: entry.tool_use_id }, "repositories_truncated");
+      return;
+    }
+    repositoryKeys.add(key);
+    repositories.push(entry);
+  };
+  for (const activity of repositoryActivity.values()) emitRepository(activity.initial ?? activity.first);
+  for (const activity of repositoryActivity.values()) {
+    emitRepository(activity.first);
+    emitRepository(activity.last);
+  }
   const encoded = JSON.stringify(cache);
   if (!existsSync(file) || readFileSync(file, "utf8") !== encoded) {
     mkdirSync(dirname(file), { recursive: true });
@@ -381,5 +468,8 @@ export function collectGitEvidence({
     provenance_version: 1,
     commits_complete: complete,
     commits: evidence,
+    repositories,
+    commit_references: references,
+    diagnostics,
   };
 }

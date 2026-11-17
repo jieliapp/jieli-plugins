@@ -1,5 +1,5 @@
 import { parse, forEachChild } from "unbash";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 
 // Only literal words are usable as repository/command evidence. Parsing an
 // expansion does not tell us what it evaluated to in the original process.
@@ -113,16 +113,17 @@ export function commitCommands(input, cwd) {
   if (!ast) return null;
   const commands = [];
   let errexit = false;
+  let currentDir = resolve(cwd, input.workdir || input.cwd || ".");
   let loopSeen = false;
   let preparationSeen = false, endsInProducer = false;
-  const visit = (node, { piped = false, readOnly = false, variables = {}, topLevel = false } = {}) => {
+  const visit = (node, { piped = false, readOnly = false, variables = {}, topLevel = false, directorySafe = false } = {}) => {
     if (node.type === "Statement") {
       if (node.background) return false; // Background statements are not completion evidence.
-      return visit(node.command, { piped, readOnly, variables, topLevel });
+      return visit(node.command, { piped, readOnly, variables, topLevel, directorySafe });
     }
     if (node.type === "AndOr") {
       return node.operators.every(op => op === "&&") &&
-        node.commands.every(child => visit(child, { piped, readOnly, variables }));
+        node.commands.every(child => visit(child, { piped, readOnly, variables, directorySafe }));
     }
     if (node.type === "Pipeline") {
       return !node.prefixes.length && node.operators.every(op => op === "|") &&
@@ -153,6 +154,11 @@ export function commitCommands(input, cwd) {
       errexit = true;
       return true;
     }
+    if (executable === "cd") {
+      if (!directorySafe || readOnly || piped || redirects.length || args.length !== 1 || args[0].startsWith("-")) return false;
+      currentDir = resolve(currentDir, args[0]);
+      return true;
+    }
     if (executable !== "git") {
       if (["python", "python3"].includes(executable)) {
         if (!topLevel || readOnly || piped || commands.length || args.length !== 1 || args[0] !== "-" || !literalStdin) return false;
@@ -162,7 +168,7 @@ export function commitCommands(input, cwd) {
       return !literalStdin && !readOnly && commands.length > 0 &&
         (["rg", "head"].includes(executable) || (executable === "go" && args[0] === "test"));
     }
-    let dir = input.workdir || input.cwd || cwd;
+    let dir = currentDir;
     let i = 0;
     while (args[i] === "-C" || args[i] === "-c") {
       if (!args[i + 1]) return false;
@@ -187,7 +193,7 @@ export function commitCommands(input, cwd) {
     // Without errexit, a later top-level command can mask a failed producer.
     if (commands.length && !errexit) return null;
     const before = commands.length;
-    if (!visit(statement, { topLevel: true })) return null;
+    if (!visit(statement, { topLevel: true, directorySafe: index === ast.commands.length - 1 || (errexit && statement.command.type !== "AndOr") })) return null;
     // errexit does not abort a nonfinal && list when an earlier operand fails.
     // Only the final list has its success established by the tool exit status.
     if (commands.length > before && statement.command.type === "AndOr" && index !== ast.commands.length - 1) return null;
@@ -195,4 +201,97 @@ export function commitCommands(input, cwd) {
   // Python is opaque preparation. Require the final shell status to belong to
   // a producer (or its && chain), never a following status/inspection command.
   return preparationSeen && !endsInProducer ? null : commands;
+}
+
+// A separate, weaker observation path. This never upgrades opaque programs to
+// execution evidence; only the strict parser above may do that. All syntax and
+// control-flow decisions come from unbash, including heredoc boundaries.
+export function shellActivity(input, cwd) {
+  const ast = script(input.cmd ?? input.command);
+  if (!ast) return { dirs: [], targetDirs: [], producer: true, referenceEligible: false };
+  let producer = false;
+  const scan = node => {
+    if (node.type === 'Command') {
+      const executable = literal(node.name);
+      const args = node.suffix.filter(p => p.type === 'Word').map(p => literal(p));
+      if (executable && /^(?:.*\/)?python(?:\d+(?:\.\d+)*)?$/.test(executable)) producer = true;
+      if (executable && basename(executable) === 'git') {
+        let i = 0;
+        // Detection only: standard global options locate the subcommand but
+        // do not prove its repository or execution. Keep the strict parser and
+        // reference eligibility unchanged for these unsupported invocations.
+        while (i < args.length) {
+          const arg = args[i];
+          if (arg === null) break;
+          if (['-p', '--paginate', '-P', '--no-pager', '--no-replace-objects', '--no-lazy-fetch', '--no-optional-locks', '--no-advice', '--bare', '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs'].includes(arg)) {
+            i++;
+          } else if (['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix', '--attr-source'].includes(arg)) {
+            if (args[i + 1] === undefined) break;
+            i += 2;
+          } else if (arg.includes('=') && ['--git-dir', '--work-tree', '--namespace', '--config-env', '--exec-path', '--super-prefix', '--attr-source'].includes(arg.split('=', 1)[0])) {
+            i++;
+          } else break; // Stop at the action, including read-only/help actions.
+        }
+        if (['commit', 'cherry-pick'].includes(args[i])) producer = true;
+      }
+    }
+    forEachChild(node, scan);
+  };
+  scan(ast);
+  let dir = resolve(cwd, input.workdir || input.cwd || ".");
+  let errexit = false, eligible = true;
+  const dirs = [], targetDirs = [];
+  const visit = (node, directorySafe, topLevel = false) => {
+    if (node.type === 'Statement') return !node.background && visit(node.command, directorySafe, topLevel);
+    if (node.type === 'AndOr') return node.operators.every(op => op === '&&') && node.commands.every(child => visit(child, directorySafe));
+    if (node.type !== 'Command' || node.prefix.length) return false;
+    const executable = literal(node.name);
+    const args = node.suffix.filter(p => p.type === 'Word').map(p => literal(p));
+    if (!executable || args.some(a => a === null)) return false;
+    const python = /^(?:.*\/)?python(?:\d+(?:\.\d+)*)?$/.test(executable);
+    // Only commands known not to mutate the parent shell's execution state.
+    // In particular exit/exec/eval/source/export/trap/pushd are not neutral.
+    if (!python && !['git', 'cd', 'set', 'true', 'false', 'echo', 'printf', 'cat', 'rg', 'head', 'tail', 'sed', 'ls', 'pwd', 'go', 'npm', 'node', 'wc', 'find', 'sleep', 'touch', 'mkdir'].includes(executable)) return false;
+    if (executable === 'set') {
+      if (!topLevel || dirs.length || args.join(' ') !== '-e' || node.suffix.some(p => p.type !== 'Word')) return false;
+      errexit = true;
+      return true;
+    }
+    if (executable === 'cd') {
+      if (!directorySafe || args.length !== 1 || args[0].startsWith('-') || node.suffix.some(p => p.type !== 'Word')) return false;
+      dir = resolve(dir, args[0]);
+      dirs.push(dir);
+      return true;
+    }
+    if (executable === 'git') {
+      let target = dir, i = 0;
+      while (['-C', '-c'].includes(args[i])) {
+        if (!args[i + 1]) return false;
+        if (args[i] === '-C') target = resolve(target, args[i + 1]);
+        // Environment/config overrides can change both repository and output.
+        if (args[i] === '-c') eligible = false;
+        i += 2;
+      }
+      const action = args[i], options = args.slice(i + 1);
+      if (!['add', 'commit', 'cherry-pick', 'push', 'diff', 'status', 'rev-parse', 'log', 'show', 'remote'].includes(action)) eligible = false;
+      if (action === 'commit' && (!commitOptions(options) || node.suffix.some(p => p.type !== 'Word'))) eligible = false;
+      if (action === 'cherry-pick' && options.some(a => a.startsWith('-') && !['--continue', '-x'].includes(a))) eligible = false;
+      targetDirs.push(target);
+      if (directorySafe) dirs.push(target);
+    } else {
+      if (directorySafe) dirs.push(dir);
+      if (python) {
+        targetDirs.push(dir);
+        if (node.suffix.some(p => p.type !== 'Word' && !(p.type === 'HereDoc' && p.delimiter?.quoted && p.closing && (!p.descriptor || (p.descriptor.type === 'FileDescriptor' && p.descriptor.value === 0))))) eligible = false;
+      }
+      else if (executable !== 'cat' || !node.suffix.some(p => p.type === 'Redirect' && ['>', '>>'].includes(p.operator))) eligible = false;
+    }
+    return true;
+  };
+  for (const [index, statement] of ast.commands.entries()) {
+    if (!visit(statement, index === ast.commands.length - 1 || (errexit && statement.command.type !== 'AndOr'), index === 0)) {
+      return { dirs: [], targetDirs: [], producer, referenceEligible: false };
+    }
+  }
+  return { dirs, targetDirs, producer, referenceEligible: producer && eligible };
 }

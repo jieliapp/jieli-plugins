@@ -782,3 +782,246 @@ test('Python preparation cannot mask failed or skipped commits or add ambiguous 
     assert.equal(f.collect([user('u'), candidate, result('ambiguous-python', executed.stdout, executed.status)]).commits.length, 0, command);
   }
 });
+
+test('repository activity and strict commits follow literal cd without leaking between calls', t => {
+  const f = fixture(t);
+  const committed = f.commit('directory ownership');
+  const candidate = call('cd', f.temp);
+  candidate.content[0].input.cmd = 'cd repo && git commit -m "directory ownership"';
+  const inspect = call('inspect', f.temp);
+  inspect.content[0].input.cmd = 'git status --short';
+  const captured = f.collect([candidate, result('cd', committed.output), inspect, result('inspect', '')]);
+  assert.equal(captured.commits[0]?.commit_sha, committed.sha);
+  assert.ok(captured.repositories.some(r => r.git_root === f.cwd && r.tool_use_id === 'cd' && r.message_id === 'cd'));
+  assert.ok(!captured.repositories.some(r => r.tool_use_id === 'inspect'));
+});
+
+test('explicit unsupported commit modes cannot be rescued as output references', t => {
+  const f = fixture(t), committed = f.commit('real object');
+  for (const command of ['git commit --dry-run', 'git cherry-pick --abort', 'git commit -m "$MESSAGE"', 'echo spoof; git commit -m change', 'git log --format="[main %h] %s"']) {
+    const candidate = call('unsupported', f.cwd);
+    candidate.content[0].input.cmd = command;
+    const captured = f.collect([candidate, result('unsupported', committed.output)]);
+    assert.deepEqual(captured.commit_references, [], command);
+  }
+});
+
+test('masked failures and unsafe directory control flow do not establish repository activity', t => {
+  const f = fixture(t);
+  f.commit('base');
+  for (const command of [
+    'git -C repo rev-parse missing-ref; true',
+    'false && git -C repo status; true',
+    'cd repo; git status',
+    'cd "$TARGET" && git status',
+    'cd missing || cd repo; git status',
+    'if true; then cd repo; fi; git status',
+    '(cd repo); git status',
+  ]) {
+    const candidate = call('unsafe-cwd', f.temp);
+    candidate.content[0].input.cmd = command;
+    const captured = f.collect([candidate, result('unsafe-cwd', '')]);
+    assert.deepEqual(captured.repositories, [], command);
+  }
+});
+
+for (const python of ['python3', '.venv/bin/python']) test(`${python}: opaque completed producer yields only object-checked output references`, t => {
+  const f = fixture(t);
+  const committed = f.commit('opaque child');
+  const candidate = call('opaque', f.cwd);
+  candidate.content[0].input.cmd = `${python} - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'commit', '-m', 'opaque child'], check=True)\nPY\ngit push origin main`;
+  const captured = f.collect([user('u'), candidate, result('opaque', committed.output)]);
+  assert.deepEqual(captured.commits, []);
+  assert.equal(captured.commit_references[0]?.commit_sha, committed.sha);
+  assert.equal(captured.commit_references[0]?.commit_tool_use_id, 'opaque');
+  assert.equal(captured.commit_references[0]?.commit_message_id, 'opaque');
+  assert.equal(captured.commits_complete, false);
+  assert.ok(captured.diagnostics.some(d => d.code === 'unsupported_producer'));
+  assert.deepEqual(f.collect([user('u'), candidate, result('opaque', committed.output)]), captured);
+  assert.deepEqual(f.collect([candidate, result('opaque', committed.output, 1)]).commit_references, [], 'failed whole tool is never promoted');
+  assert.deepEqual(f.collect([candidate, result('opaque', committed.output.replace('opaque child', 'wrong subject'))]).commit_references, []);
+  assert.deepEqual(f.collect([candidate, result('opaque', committed.output + '\n' + committed.output)]).commit_references, [], 'duplicate summaries are ambiguous');
+  const other = join(f.temp, 'other');
+  f.git('init', other);
+  f.git('-C', other, 'remote', 'add', 'origin', 'git@github.com:acme/other.git');
+  candidate.content[0].input.cmd += `\ngit -C "${other}" status --short`;
+  assert.deepEqual(f.collect([candidate, result('opaque', committed.output)]).commit_references, [], 'multiple target repos are ambiguous');
+});
+
+test('missing opaque producer objects report incompleteness and retry when the object returns', t => {
+  const f = fixture(t), committed = f.commit('restored object');
+  const object = join(f.cwd, '.git/objects', committed.sha.slice(0, 2), committed.sha.slice(2));
+  const backup = join(f.temp, 'object-backup');
+  const candidate = call('opaque-missing', f.cwd);
+  candidate.content[0].input.cmd = "python3 - <<'PY'\npass\nPY";
+  const messages = [candidate, result('opaque-missing', committed.output)];
+  renameSync(object, backup);
+  const missing = f.collect(messages);
+  assert.deepEqual(missing.commit_references, []);
+  assert.equal(missing.commits_complete, false);
+  assert.ok(missing.diagnostics.some(d => d.code === 'object_lookup_failed'));
+  assert.deepEqual(f.collect(messages), missing);
+  renameSync(backup, object);
+  assert.equal(f.collect(messages).commit_references[0]?.commit_sha, committed.sha);
+});
+
+test('diagnostics are bounded and never turn incomplete replay into a full replacement', t => {
+  const f = fixture(t);
+  const messages = [];
+  for (let i = 0; i < 110; i++) {
+    const candidate = call(`unsupported-${i}`, f.cwd);
+    candidate.content[0].input.cmd = 'git commit --dry-run';
+    messages.push(candidate, result(`unsupported-${i}`, ''));
+  }
+  const captured = f.collect(messages);
+  assert.equal(captured.diagnostics.length, 100);
+  assert.ok(captured.diagnostics.some(d => d.code === "diagnostics_truncated"));
+  assert.equal(captured.commits_complete, false);
+});
+
+test('a skipped errexit cannot prove earlier repository activity', t => {
+  const f = fixture(t);
+  const candidate = call('skipped-set', f.temp);
+  candidate.content[0].input.cmd = 'false && set -e\ngit -C repo rev-parse missing-ref\ntrue';
+  assert.deepEqual(f.collect([candidate, result('skipped-set', '')]).repositories, []);
+});
+
+test('reused polling handles do not leak old commit summaries into another execution', t => {
+  const f = fixture(t), first = f.commit('one'), second = f.commit('two');
+  const poll = (id) => ({role:'assistant', message_id:id, content:[{type:'tool_use', id, name:'write_stdin', input:{session_id:12, chars:''}}]});
+  const messages = [call('one', f.cwd), result('one', `Process running with session ID 12\n${first.output}`), poll('end-one'), result('end-one', ''),
+    call('two', f.cwd), result('two', `Process running with session ID 12\n${second.output}`), poll('end-two'), result('end-two', '')];
+  assert.deepEqual(f.collect(messages).commits.map(c => c.commit_sha), [first.sha, second.sha]);
+});
+
+test('relative tool cwd and linked/nested read-only Git activity use the actual repository boundary', t => {
+  const f = fixture(t);
+  f.commit('base');
+  const linked = join(f.temp, 'linked');
+  f.git('-C', f.cwd, 'worktree', 'add', '-b', 'activity', linked);
+  const nested = join(linked, 'nested');
+  f.git('init', nested);
+  f.git('-C', nested, 'remote', 'add', 'origin', 'git@github.com:acme/nested.git');
+  const candidate = call('relative', f.temp);
+  candidate.timestamp_ms = 1794877200000;
+  candidate.content[0].input = {cmd:'git status --short', cwd:'repo'};
+  const activity = call('linked-read', linked);
+  activity.content[0].input.cmd = 'git -C nested status --short';
+  const captured = f.collect([candidate, result('relative', ''), activity, result('linked-read', '')]);
+  assert.ok(captured.repositories.some(r => r.git_root === f.cwd && r.tool_use_id === 'relative' && r.event_ms === 1794877200000));
+  assert.ok(captured.repositories.some(r => r.git_root === nested && r.git_remote_url === 'git@github.com:acme/nested.git' && r.tool_use_id === 'linked-read'));
+  assert.deepEqual(captured.commit_references, []);
+  const initial = collectGitEvidence({provider:'codex', sessionId:'initial', cwd:linked, messages:[], cacheDir:join(f.temp, 'initial-cache')});
+  assert.deepEqual(initial.repositories, [{git_root:linked, git_remote_url:'git@github.com:acme/project.git'}]);
+});
+
+test('shell termination and directory-changing builtins cannot make skipped tools into activity', t => {
+  const f = fixture(t);
+  for (const prefix of ['exit 0', 'exec true', 'eval "cd repo"', 'source setup.sh', 'pushd repo']) {
+    const candidate = call('terminate', f.temp);
+    candidate.content[0].input.cmd = `${prefix}; git -C repo status --short`;
+    assert.deepEqual(f.collect([candidate, result('terminate', '')]).repositories, [], prefix);
+  }
+});
+
+test('repository activity upload caps distinct repositories at 256 with a truncation diagnostic', t => {
+  const f = fixture(t), messages = [];
+  for (let i = 0; i < 257; i++) {
+    const repo = join(f.temp, `repository-${i}`);
+    f.git('init', repo);
+    const candidate = call(`activity-${i}`, repo);
+    candidate.content[0].input.cmd = 'git status --short';
+    messages.push(candidate, result(`activity-${i}`, ''));
+  }
+  const p = f.collect(messages);
+  assert.equal(p.repositories.length, 256);
+  assert.equal(p.commits_complete, false);
+  assert.ok(p.diagnostics.some(d => d.code === 'repositories_truncated' && d.tool_use_id === 'activity-256'));
+});
+
+test('output references upload is capped at 500 with real unique Git objects', {skip: !process.env.JIELI_PROVENANCE_LIMIT_TEST}, t => {
+  const f = fixture(t);
+  const base = f.commit('base');
+  const tree = f.git('-C', f.cwd, 'rev-parse', `${base.sha}^{tree}`);
+  const summaries = [];
+  for (let i = 0; i < 501; i++) {
+    const sha = f.git('-C', f.cwd, 'commit-tree', tree, '-p', base.sha, '-m', `reference ${i}`);
+    summaries.push(`[main ${sha}] reference ${i}`);
+  }
+  const candidate = call('reference-limit', f.cwd);
+  candidate.content[0].input.cmd = "python3 - <<'PY'\npass\nPY";
+  const p = f.collect([candidate, result('reference-limit', summaries.join('\n'))]);
+  assert.equal(p.commit_references.length, 500);
+  assert.equal(p.commits_complete, false);
+  assert.ok(p.diagnostics.some(d => d.code === 'commit_references_truncated'));
+});
+
+test('a partial replay cannot revoke previously captured verified producer evidence', t => {
+  const f = fixture(t), committed = f.commit('observed earlier');
+  const candidate = call('partial', f.cwd);
+  assert.equal(f.collect([candidate, result('partial', committed.output)]).commits.length, 1);
+  for (const messages of [[candidate], [candidate, result('partial', 'Process running with session ID 44\n')]]) {
+    const partial = f.collect(messages);
+    assert.equal(partial.commits_complete, false);
+    assert.ok(partial.diagnostics.some(d => d.code === 'producer_not_completed'));
+  }
+});
+
+test('repeated activity preserves first/last anchors without starving a distinct repository', t => {
+  const f = fixture(t), messages = [];
+  const other = join(f.temp, 'other');
+  f.git('init', other);
+  for (let i = 0; i < 260; i++) {
+    const candidate = call(`repeat-${i}`, f.cwd);
+    candidate.content[0].input.cmd = 'git status --short';
+    messages.push(candidate, result(`repeat-${i}`, ''));
+  }
+  const candidate = call('distinct', other);
+  candidate.content[0].input.cmd = 'git status --short';
+  messages.push(candidate, result('distinct', ''));
+  const p = f.collect(messages);
+  assert.deepEqual(p.repositories.map(r => r.tool_use_id), ['repeat-0', 'distinct', 'repeat-259']);
+  assert.equal(p.commits_complete, true);
+});
+
+for (const variant of [
+  'no-pager', 'pager-short', 'global-flags', 'repository-equals',
+  'repository-separated', 'namespace-value', 'config-env', 'mixed-C-c',
+  'bare-worktree', 'absolute-binary', 'absolute-global',
+]) test(`unsupported Git producer stays incomplete without new claims: ${variant}`, t => {
+  const f = fixture(t), retained = f.commit('retained');
+  const absoluteGit = spawnSync('which', ['git'], {encoding:'utf8'}).stdout.trim();
+  const options = {
+    'no-pager': ['--no-pager'],
+    'pager-short': ['-P'],
+    'global-flags': ['--no-optional-locks', '--no-replace-objects', '--no-lazy-fetch', '--no-advice', '--literal-pathspecs'],
+    'repository-equals': [`--git-dir=${f.cwd}/.git`, `--work-tree=${f.cwd}`],
+    'repository-separated': ['--git-dir', `${f.cwd}/.git`, '--work-tree', f.cwd],
+    'namespace-value': ['--namespace', 'commit'],
+    'config-env': ['--config-env=user.name=GIT_AUTHOR_DATE'],
+    'mixed-C-c': ['--no-pager', '-C', f.cwd, '-c', 'core.quotePath=false'],
+    'bare-worktree': ['--bare', `--git-dir=${f.cwd}/.git`, `--work-tree=${f.cwd}`],
+    'absolute-binary': [],
+    'absolute-global': ['--no-pager', '-C', f.cwd],
+  }[variant];
+  const executable = variant.startsWith('absolute-') ? absoluteGit : 'git';
+  const command = (action, args) => [executable, ...options, action, ...args].map(word => JSON.stringify(word)).join(' ');
+  const prior = [call('retained', f.cwd), result('retained', retained.output)];
+  assert.equal(f.collect(prior).commits[0]?.commit_sha, retained.sha);
+  // Fixture-owned Git invocation: never execute the command string under test.
+  const output = f.git('-C', f.cwd, ...options, 'commit', '--allow-empty', '-m', 'change');
+  const candidate = call('unsupported-global', f.cwd);
+  candidate.content[0].input.cmd = command('commit', ['--allow-empty', '-m', 'change']);
+  const captured = f.collect([...prior, candidate, result('unsupported-global', output)]);
+  assert.equal(captured.commits_complete, false);
+  assert.ok(captured.diagnostics.some(d => d.tool_use_id === 'unsupported-global' && d.code === 'unsupported_producer'));
+  assert.deepEqual(captured.commits.map(c => c.commit_sha), [retained.sha]);
+  assert.deepEqual(captured.commit_references, []);
+  const inspection = call('inspection-global', f.cwd);
+  const format = '--format=[main %h] %s';
+  inspection.content[0].input.cmd = command('log', ['-1', format]);
+  const inspected = f.collect([...prior, inspection, result('inspection-global', f.git('-C', f.cwd, ...options, 'log', '-1', format))]);
+  assert.equal(inspected.commits_complete, true, 'read-only summary output must not be classified as a producer');
+  assert.deepEqual(inspected.commits.map(c => c.commit_sha), [retained.sha]);
+  assert.deepEqual(inspected.commit_references, []);
+});

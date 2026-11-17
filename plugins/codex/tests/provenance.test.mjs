@@ -74,3 +74,49 @@ for (const provider of ['codex', 'claude-code']) test(`${provider}: standalone p
     assert.equal(payload.commits_complete, true);
   });
 });
+
+for (const provider of ['codex', 'claude-code']) test(`${provider}: hook payload keeps Python output references separate through repeated polls`, async t => {
+  const temp = mkdtempSync(join(tmpdir(), 'jieli-opaque-hook-'));
+  t.after(() => rmSync(temp, {recursive:true, force:true}));
+  const cwd = join(temp, 'repo');
+  const git = (...args) => {
+    const r = spawnSync('git', args, {encoding:'utf8'});
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  git('init', '-b', 'main', cwd);
+  git('-C', cwd, 'config', 'user.name', 'Test');
+  git('-C', cwd, 'config', 'user.email', 'test@example.test');
+  git('-C', cwd, 'remote', 'add', 'origin', 'git@github.com:acme/opaque.git');
+  const program = "import subprocess\nsubprocess.run(['git', 'commit', '--allow-empty', '-m', 'child commit'], check=True)";
+  const executed = spawnSync('python3', ['-c', program], {cwd, encoding:'utf8'});
+  assert.equal(executed.status, 0, executed.stderr);
+  const sha = git('-C', cwd, 'rev-parse', 'HEAD');
+  const command = `python3 - <<'PY'\n${program}\nPY`;
+  const entries = provider === 'codex' ? [
+    {type:'session_meta', payload:{id:'opaque', cwd}},
+    {type:'response_item', payload:{type:'function_call', call_id:'child', name:'exec_command', arguments:JSON.stringify({cmd:command, workdir:cwd})}},
+    {type:'response_item', payload:{type:'function_call_output', call_id:'child', output:'Process running with session ID 12\n'}},
+    {type:'response_item', payload:{type:'function_call', call_id:'progress', name:'write_stdin', arguments:JSON.stringify({session_id:12, chars:''})}},
+    {type:'response_item', payload:{type:'function_call_output', call_id:'progress', output:`Process running with session ID 12\n${executed.stdout}`}},
+    {type:'response_item', payload:{type:'function_call', call_id:'finish', name:'write_stdin', arguments:JSON.stringify({session_id:12, chars:''})}},
+    {type:'response_item', payload:{type:'function_call_output', call_id:'finish', output:'Process exited with code 0\nFinal output:\n'}},
+  ] : [
+    {type:'assistant', uuid:'child-message', sessionId:'opaque', cwd, message:{role:'assistant', content:[{type:'tool_use', id:'child', name:'Bash', input:{command, cwd}}]}},
+    {type:'user', uuid:'result-message', sessionId:'opaque', cwd, message:{role:'user', content:[{type:'tool_result', tool_use_id:'child', content:executed.stdout}]}},
+  ];
+  const transcript = join(temp, 'session.jsonl');
+  writeFileSync(transcript, entries.map(JSON.stringify).join('\n'));
+  const runtime = provider === 'codex' ? codex : claude;
+  await withEnv({HOME:temp}, async () => {
+    const build = () => runtime.buildPayloadFromHook({transcript_path:transcript, session_id:'opaque', cwd}, 'https://offline.invalid', null,
+      ...(provider === 'codex' ? [null, {includeSummaryStats:false}] : [{includeSummaryStats:false}]));
+    const p = await build();
+    assert.deepEqual(p.commits, []);
+    assert.deepEqual(p.commit_references.map(c => [c.commit_sha, c.commit_tool_use_id]), [[sha, 'child']]);
+    assert.equal(p.commits_complete, false);
+    assert.ok(p.repositories.some(r => r.tool_use_id === 'child' && r.message_id));
+    const again = await build();
+    assert.deepEqual(again.commit_references, p.commit_references);
+  });
+});
