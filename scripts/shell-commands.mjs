@@ -107,7 +107,7 @@ export function injectTrailer(source, trailer) {
 
 // Accept deterministic success chains, not an interpreter for arbitrary shell.
 // The caller still requires completed output and verifies each Git object.
-export function commitCommands(input, cwd) {
+export function commitCommands(input, cwd, { reference = false } = {}) {
   const source = input.cmd ?? input.command;
   const ast = script(source);
   if (!ast) return null;
@@ -116,6 +116,7 @@ export function commitCommands(input, cwd) {
   let currentDir = resolve(cwd, input.workdir || input.cwd || ".");
   let loopSeen = false;
   let preparationSeen = false, endsInProducer = false;
+  let followUpSeen = false;
   const visit = (node, { piped = false, readOnly = false, variables = {}, topLevel = false, directorySafe = false } = {}) => {
     if (node.type === "Statement") {
       if (node.background) return false; // Background statements are not completion evidence.
@@ -126,11 +127,11 @@ export function commitCommands(input, cwd) {
         node.commands.every(child => visit(child, { piped, readOnly, variables, directorySafe }));
     }
     if (node.type === "Pipeline") {
-      return !node.prefixes.length && node.operators.every(op => op === "|") &&
+      return !reference && !node.prefixes.length && node.operators.every(op => op === "|") &&
         node.commands.every(child => visit(child, { piped: true, readOnly, variables }));
     }
     if (node.type === "For") {
-      if (readOnly || !errexit || !commands.length || !node.wordlist?.length || node.wordlist.length > 64) return false;
+      if (reference || readOnly || !errexit || !commands.length || !node.wordlist?.length || node.wordlist.length > 64) return false;
       const key = literal(node.name);
       const values = node.wordlist.map(word => literal(word));
       if (!key || values.some(value => value === null)) return false;
@@ -142,6 +143,7 @@ export function commitCommands(input, cwd) {
     const executable = literal(node.name);
     const words = node.suffix.filter(part => part.type === "Word");
     const redirects = node.suffix.filter(part => part.type !== "Word");
+    if (reference && redirects.length) return false;
     const literalStdin = redirects.length === 1 && redirects[0].type === "HereDoc" &&
       ["<<", "<<-"].includes(redirects[0].operator) && redirects[0].delimiter?.quoted &&
       Boolean(redirects[0].closing) && (!redirects[0].descriptor ||
@@ -160,6 +162,7 @@ export function commitCommands(input, cwd) {
       return true;
     }
     if (executable !== "git") {
+      if (reference) return false;
       if (["python", "python3"].includes(executable)) {
         if (!topLevel || readOnly || piped || commands.length || args.length !== 1 || args[0] !== "-" || !literalStdin) return false;
         preparationSeen = true;
@@ -172,32 +175,51 @@ export function commitCommands(input, cwd) {
     let i = 0;
     while (args[i] === "-C" || args[i] === "-c") {
       if (!args[i + 1]) return false;
+      if (reference && args[i] === "-c") return false;
       if (args[i] === "-C") dir = resolve(dir, args[i + 1]);
       i += 2;
     }
     const action = args[i++];
     const options = args.slice(i);
+    if (action === "merge-base" && options.length === 3 && options[0] === "--is-ancestor" && options.slice(1).every(arg => arg && !arg.startsWith("-"))) {
+      if (commands.length) followUpSeen = true;
+      return !piped && !redirects.length;
+    }
+    if (commands.length && !readOnly && (action === "push" || action === "ls-remote")) {
+      const flags = action === "push"
+        ? ["-u", "--set-upstream", "--force-with-lease", "--porcelain", "-q", "--quiet", "-v", "--verbose"]
+        : ["--exit-code", "--heads", "--branches", "--tags", "--refs"];
+      followUpSeen = true;
+      return !piped && !redirects.length && options.every(arg => arg && (!arg.startsWith("-") || flags.includes(arg)));
+    }
     if (action !== "commit" && action !== "cherry-pick") {
+      if (reference) {
+        if (action === "diff") return options.length > 0 && options.every(arg => ["--cached", "--check", "--name-status", "--stat", "--no-ext-diff", "--no-textconv"].includes(arg));
+        if (action === "status") return options.every(arg => ["--short", "--branch", "--porcelain", "-sb"].includes(arg));
+        return action === "add";
+      }
       return !literalStdin && (["diff", "status", "rev-parse", "log"].includes(action) || (!readOnly && action === "add"));
     }
+    if (reference && (action !== "commit" || commands.length)) return false;
     if (readOnly || piped || loopSeen) return false;
     const mode = action === "commit" ? commitOptions(options) : { amend: false };
     if (!mode) return false;
     if (redirects.length && !(literalStdin && mode.stdin)) return false;
     if (action === "cherry-pick" && options.some(option => option.startsWith("-") && !["--continue", "-x"].includes(option))) return false;
-    commands.push({ dir, amend: mode.amend });
+    commands.push({ dir, amend: !reference && mode.amend });
     endsInProducer = true;
     return true;
   };
   for (const [index, statement] of ast.commands.entries()) {
     // Without errexit, a later top-level command can mask a failed producer.
-    if (commands.length && !errexit) return null;
+    if (!reference && commands.length && !errexit) return null;
     const before = commands.length;
     if (!visit(statement, { topLevel: true, directorySafe: index === ast.commands.length - 1 || (errexit && statement.command.type !== "AndOr") })) return null;
     // errexit does not abort a nonfinal && list when an earlier operand fails.
     // Only the final list has its success established by the tool exit status.
-    if (commands.length > before && statement.command.type === "AndOr" && index !== ast.commands.length - 1) return null;
+    if (!reference && commands.length > before && statement.command.type === "AndOr" && index !== ast.commands.length - 1) return null;
   }
+  if (reference && !followUpSeen) return null;
   // Python is opaque preparation. Require the final shell status to belong to
   // a producer (or its && chain), never a following status/inspection command.
   return preparationSeen && !endsInProducer ? null : commands;
@@ -273,7 +295,7 @@ export function shellActivity(input, cwd) {
         i += 2;
       }
       const action = args[i], options = args.slice(i + 1);
-      if (!['add', 'commit', 'cherry-pick', 'push', 'diff', 'status', 'rev-parse', 'log', 'show', 'remote'].includes(action)) eligible = false;
+      if (!['add', 'commit', 'cherry-pick', 'push', 'diff', 'status', 'remote'].includes(action)) eligible = false;
       if (action === 'commit' && (!commitOptions(options) || node.suffix.some(p => p.type !== 'Word'))) eligible = false;
       if (action === 'cherry-pick' && options.some(a => a.startsWith('-') && !['--continue', '-x'].includes(a))) eligible = false;
       targetDirs.push(target);

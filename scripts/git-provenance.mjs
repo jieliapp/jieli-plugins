@@ -288,26 +288,33 @@ export function collectGitEvidence({
         !["Bash", "shell_command", "exec_command"].includes(name(tool))
       )
         continue;
-      let commands = commitCommands(tool.input ?? {}, cwd);
+      const input = tool.input ?? {};
       const activity = shellActivity(tool.input ?? {}, cwd);
       const terminal = completions.get(tool.id);
-      if (!terminal || !completed(terminal.block)) {
-        if (activity.producer) diagnose(tool, !terminal || terminal.block.run?.status !== "completed" ? "producer_not_completed" : "producer_not_successful");
-        continue;
-      }
-      for (const dir of activity.dirs) addRepository(repositoryFor(dir), tool, m);
-      let reference = false;
+      const run = terminal?.block.run;
+      const successful = terminal && completed(terminal.block);
+      const exitCode = run?.result?.exitCode;
+      const failed = ["completed", "error"].includes(run?.status) && Number.isInteger(exitCode) && exitCode > 0;
+      if (successful) for (const dir of activity.dirs) addRepository(repositoryFor(dir), tool, m);
+      let commands = successful ? commitCommands(input, cwd) : null;
+      let reference = false, singleSummary = false;
       if (!commands?.length) {
         if (!activity.producer) continue;
-        diagnose(tool, "unsupported_producer");
+        diagnose(tool, successful ? "unsupported_producer" : failed ? "producer_not_successful" : "producer_not_completed");
+        if (!successful && !failed) continue;
+        commands = commitCommands(input, cwd, { reference: true });
+        reference = true;
+        singleSummary = Boolean(commands?.length);
+      }
+      if (!commands?.length) {
+        if (!successful || !activity.referenceEligible) continue;
         const targets = new Map();
         for (const dir of activity.targetDirs) {
           const context = repositoryFor(dir);
           if (!context) { targets.set(dir, null); continue; }
           targets.set(context.git_root, context);
         }
-        if (!activity.referenceEligible || targets.size !== 1 || ![...targets.values()][0]?.git_remote_url) continue;
-        reference = true;
+        if (targets.size !== 1 || ![...targets.values()][0]?.git_remote_url) continue;
         commands = [{ dir: [...targets.values()][0].git_root, amend: false }];
       }
       const fingerprint = createHash("sha256")
@@ -319,7 +326,7 @@ export function collectGitEvidence({
         /^\[[^\]\r\n]+\s(?:\(root-commit\)\s)?([a-f0-9]{7,40})\]\s[^\r\n]+/gm,
       )];
       const prefixes = headers.map(h => h[1]).sort();
-      if (!headers.length || (!reference && headers.length !== commands.length) || prefixes.some((prefix, i) => i > 0 && prefix.startsWith(prefixes[i - 1]))) {
+      if (!headers.length || ((!reference || singleSummary) && headers.length !== commands.length) || prefixes.some((prefix, i) => i > 0 && prefix.startsWith(prefixes[i - 1]))) {
         diagnose(tool, "ambiguous_commit_summary");
         continue;
       }

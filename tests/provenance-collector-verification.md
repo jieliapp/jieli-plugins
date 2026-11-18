@@ -39,11 +39,38 @@ commands known not to change parent-shell state. Its supported opaque producer
 includes Python executable paths such as `.venv/bin/python`; a heredoc must be
 literal/quoted. References require a completed successful tool, one known Git
 repository, unique summaries, resolved local commit objects and matching object
-subjects. Standalone Git inspection creates no references. Failed whole tools
-are not promoted on the strength of a printed summary. A producer in its own
-successful tool retains its evidence regardless of a later tool's failure.
+subjects. Standalone Git inspection creates no references. The literal compound
+commit case below permits a weaker reference after a nonzero exit; opaque
+producers still require successful completion. A producer in its own successful
+tool retains its evidence regardless of a later tool's failure.
 
 ## Acceptance and evidence
+
+Combined commit/push compatibility (2026-11-18):
+
+- A1: A completed, successful literal Git batch may stage, commit, check
+  ancestry, push and check the remote in one call. When existing Shell
+  control-flow checks prove execution, the claim points at the original commit
+  tool and completion, including async polling; otherwise it is a reference.
+- A2: If a bounded batch reports an explicit nonzero exit after printing one
+  commit summary, allow only a source reference, subject to local object and
+  subject verification. The collector must mark the snapshot incomplete. The
+  server must accept the anchored source without accepting a verified claim
+  for that failed result, on both upload and scoped replay.
+- A3: Skipped commits, results from a different tool, partial output and old
+  SHAs printed by inspection commands must not establish a new claim or source.
+- A4: The shell parser remains unbash; existing opaque-command rules and
+  standalone plugin/history bundle behavior remain intact except that history
+  inspection cannot contribute output references. Storing references from
+  failed tool results requires a server that supports that evidence; no server
+  deployment or production backfill is part of the plugin release.
+
+Verification: `make test` passed (179 passed, 3 skipped); the standalone and
+Cloud backend suites both passed. Offline replay recovered the reported
+execution claim at the original tool and poll anchors, and the live replay
+preview accepted those anchors without applying evidence. The earlier
+cross-repository sample still yields only output references. Independent
+review could not run because the agent runtime rejected the inherited model.
 
 | Criterion | Implementation / public behavior test | Disposition |
 | --- | --- | --- |

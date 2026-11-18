@@ -311,6 +311,62 @@ test("captures a commit surrounded by Git checks and staging", async (t) => {
   });
 });
 
+for (const outcome of ["success", "success without errexit", "push fails", "precheck skips commit", "inspection prints old SHA", "push masks failed commit"]) test(`combined Git commit and push: ${outcome}`, (t) => {
+  const fixtureRepo = fixture(t);
+  const { cwd, git } = fixtureRepo;
+  const base = fixtureRepo.commit("base");
+  const remote = join(fixtureRepo.temp, "origin.git");
+  git("init", "--bare", remote);
+  git("-C", cwd, "remote", "set-url", "origin", remote);
+  git("-C", cwd, "push", "-u", "origin", "main");
+  if (outcome === "push fails") git("-C", cwd, "remote", "set-url", "--push", "origin", join(fixtureRepo.temp, "missing.git"));
+  const masked = outcome === "push masks failed commit";
+  if (!masked) writeFileSync(join(cwd, "file.txt"), "updated\n");
+  const skipped = outcome === "precheck skips commit" || outcome === "inspection prints old SHA";
+  const command = [
+    ...(outcome === "success without errexit" || masked ? [] : ["set -e"]),
+    "git add -- file.txt",
+    "git diff --cached --check",
+    "git diff --cached --name-status",
+    ...(outcome === "inspection prints old SHA" || masked ? ["git log -1 --format='[main %h] %s'"] : []),
+    ...(skipped ? ["git merge-base --is-ancestor missing HEAD"] : []),
+    "git commit -m updated",
+    ...(!masked ? ["git merge-base --is-ancestor origin/main HEAD"] : []),
+    "git push origin HEAD:refs/heads/main",
+    ...(!masked ? ["git ls-remote --exit-code origin refs/heads/main"] : []),
+    "git status --short --branch",
+  ].join("\n");
+  const executed = spawnSync("/bin/sh", ["-c", command], { cwd, encoding: "utf8" });
+  assert.ifError(executed.error);
+  assert.equal(executed.status === 0, outcome.startsWith("success") || masked, executed.stderr);
+  const sha = git("-C", cwd, "rev-parse", "HEAD");
+  assert.equal(sha === base.sha, skipped || masked);
+  const tool = call("combined", cwd);
+  tool.content[0].input.cmd = command;
+  const poll = call("poll", cwd);
+  poll.content[0].name = "functions.write_stdin";
+  poll.content[0].input = { session_id: 123, chars: "" };
+  const terminal = result("poll", executed.stderr, executed.status);
+  if (executed.status) terminal.content[0].run.status = "error";
+  const partial = [user("request"), tool, result("combined", `Process running with session ID 123\n${executed.stdout}`)];
+  const incomplete = fixtureRepo.collect(partial);
+  assert.deepEqual(incomplete.commits, []);
+  assert.deepEqual(incomplete.commit_references, []);
+  const captured = fixtureRepo.collect([...partial, poll, terminal]);
+  assert.deepEqual(captured.commits.map(claim => claim.commit_sha), outcome === "success" ? [sha] : []);
+  assert.deepEqual(captured.commit_references.map(claim => claim.commit_sha), outcome === "push fails" || outcome === "success without errexit" ? [sha] : []);
+  assert.equal(captured.commits_complete, outcome === "success");
+  if (!skipped && !masked) {
+    const claim = captured.commits[0] ?? captured.commit_references[0];
+    assert.equal(claim.commit_tool_use_id, "combined");
+    assert.equal(claim.end_message_id, "poll:result");
+  }
+  if (outcome === "push fails") {
+    poll.content[0].input.session_id = 456;
+    assert.deepEqual(fixtureRepo.collect([...partial, poll, terminal]).commit_references, []);
+  }
+});
+
 for (const finish of ["success", "wrong session", "failure"]) test(`cherry-pick with piped checks and repeated polls: ${finish}`, (t) => {
   const f = fixture(t);
   const base = f.commit("base");
